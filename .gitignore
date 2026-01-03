@@ -1,0 +1,35 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+# Build artifacts
+build/
+dist/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+environment/
+
+# Data and artifacts
+/data/processed/*
+!/data/processed/.gitkeep
+/data/raw/*
+!/data/raw/.gitkeep
+/data/interim/*
+!/data/interim/.gitkeep
+/artifacts/*
+!/artifacts/.gitkeep
+/artifacts/models/*
+!/artifacts/models/.gitkeep
+
+# OS files
+.DS_Store
+._.DS_Store
