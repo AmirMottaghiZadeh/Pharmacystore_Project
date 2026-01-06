@@ -21,8 +21,7 @@
 12. [Reproducibility](#reproducibility)
 13. [Operational maturity checklist](#operational-maturity-checklist)
 14. [Troubleshooting](#troubleshooting)
-15. [انتقال تغییرات به ریپوی اصلی](#انتقال-تغییرات-به-ریپوی-اصلی)
-16. [Credits & maintenance](#credits--maintenance)
+15. [Credits & maintenance](#credits--maintenance)
 
 ## Why it matters
 - Automates extraction from SQL Server backups and builds a repeatable training dataset.
