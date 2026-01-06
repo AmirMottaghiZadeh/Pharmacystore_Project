@@ -1,77 +1,111 @@
-# PharmacyStore
+# 🏥 PharmacyStore Forecasting
 
-Forecast weekly unique prescriptions per drug (UPW) for an Iranian pharmacy using XGBoost on tabular data.
+> End-to-end pipeline to forecast weekly unique prescriptions (UPW) for Iranian pharmacies using XGBoost on tabular data.
 
-## Highlights
-- Limited 10-month dataset and tabular features
-- SQL Server extraction pipeline
-- Feature engineering: weekly aggregates, rolling stats, ATC classification, holiday effects
-- XGBoost training with time-based validation and walk-forward evaluation
+![Python](https://img.shields.io/badge/Python-3.11+-blue)
+![Database](https://img.shields.io/badge/SQL%20Server-Dockerized%20restore-4E8A08)
+![Model](https://img.shields.io/badge/Model-XGBoost-orange)
 
-## Prerequisites
-- Python >= 3.11
-- ODBC Driver 18 for SQL Server installed on the host
-  - Linux: `msodbcsql18`
-  - Windows: "ODBC Driver 18 for SQL Server"
-- Docker
-  - Linux: `restore_mssql_docker.sh` can install Docker if missing
-  - Windows: Docker Desktop must be installed and running
-- Network access for pip and Docker image pulls
+## Table of contents
+1. [Why it matters](#why-it-matters)
+2. [Data requirements](#data-requirements)
+3. [Repository at a glance](#repository-at-a-glance)
+4. [Quick start](#quick-start)
+5. [Execution flow](#execution-flow-run_allpy)
+6. [Architecture overview](#architecture-overview)
+7. [Manual commands](#manual-commands)
+8. [Configuration](#configuration-env)
+9. [Feature engineering](#feature-engineering)
+10. [Forecast target & evaluation](#forecast-target--evaluation)
+11. [Outputs](#outputs)
+12. [Reproducibility](#reproducibility)
+13. [Operational maturity checklist](#operational-maturity-checklist)
+14. [Troubleshooting](#troubleshooting)
+15. [انتقال تغییرات به ریپوی اصلی](#انتقال-تغییرات-به-ریپوی-اصلی)
+16. [Credits & maintenance](#credits--maintenance)
 
-## Quick Start (run_all.py)
-1. Put exactly one `.bak` file in `data/external/`.
-2. Run:
-   `python run_all.py`
-3. When prompted, enter the SQL Server SA password (it is not stored).
-4. Outputs are written to `data/processed/` and `artifacts/`.
+## Why it matters
+- Automates extraction from SQL Server backups and builds a repeatable training dataset.
+- Feature-rich weekly signals: rolling stats, ATC classification, holiday effects, and sales/price bands.
+- Walk-forward evaluation with classic baselines (naïve, moving average, seasonal naïve).
 
-## run_all.py Execution Flow (Detailed)
-1. `run_all.py` (root) calls `scripts/run_all.py`.
-2. It prompts for the SQL password and exports it only for this process:
-   - `SQL_PASS` (for restore scripts)
-   - `PHARMACYSTORE_SQL_PASSWORD` (for the pipeline)
+## Data requirements
+> ⚠️ **For stable generalization, plan for a minimum of three years of pharmacy transaction data** (prescriptions, prices, ATC metadata, and holiday calendars). Shorter horizons (e.g., the current 10-month sample) limit the ability to model seasonality and rare drugs effectively.
+
+Required external files:
+- Exactly one `.bak` file in `data/external/` (restored into SQL Server).
+- `data/external/who_atc_ddd.csv`.
+- `data/external/holidays/weekly_official_holidays.csv`.
+- Optional: `data/external/holidays/persian_holidays.csv`.
+
+## Repository at a glance
+- `src/pharmacystore/`: core package (SQL client, feature builders, models, pipeline entry points).
+- `scripts/`: runnable utilities (restore wrapper, CLI entry point for the pipeline).
+- `restore_mssql_docker.sh` / `restore_mssql_docker.ps1`: Docker-based SQL restore (Linux/Windows).
+- `data/processed/`, `artifacts/`: generated datasets, trained models, per-run metrics (gitignored).
+
+## Quick start
+1. Place exactly one `.bak` in `data/external/`.
+2. Run `python run_all.py`.
+3. When prompted, enter the SQL Server SA password (not stored on disk).
+4. Outputs land in `data/processed/` and `artifacts/`.
+
+### Execution flow (`run_all.py`)
+1. `run_all.py` (root) delegates to `scripts/run_all.py`.
+2. Passwords are exported to env vars for this process only:
+   - `SQL_PASS` (restore scripts)
+   - `PHARMACYSTORE_SQL_PASSWORD` (pipeline)
 3. Restore step (OS-specific):
-   - Windows: runs
-     `powershell -ExecutionPolicy Bypass -File .\restore_mssql_docker.ps1 -DB_NAME PharmacyStore`
-   - Linux: runs `bash scripts/restore_db.sh`, which calls `restore_mssql_docker.sh PharmacyStore`
-4. The restore script:
-   - Creates/recreates a Docker container `mssql_restore` (SQL Server 2022)
-   - Maps host port `14333` to container port `1433`
-   - Copies the single `.bak` from `data/external/` into the container
-   - Detects logical names via `RESTORE FILELISTONLY`
-   - Restores the database with `REPLACE` and returns to MULTI_USER
-   - Updates `.env` with connection settings (except the password)
-5. `scripts/run_all.py` validates required external files and installs dependencies.
-6. It runs `python -m pharmacystore.pipeline full` to extract data, build features, train models, and export outputs.
+   - **Windows:** `powershell -ExecutionPolicy Bypass -File .\restore_mssql_docker.ps1 -DB_NAME PharmacyStore`
+   - **Linux:** `bash scripts/restore_db.sh` → `restore_mssql_docker.sh PharmacyStore`
+4. Restore script actions:
+   - Creates/recreates Docker container `mssql_restore` (SQL Server 2022) mapping host `14333` → container `1433`.
+   - Copies the single `.bak` from `data/external/` into the container.
+   - Detects logical names via `RESTORE FILELISTONLY`, restores with `REPLACE`, returns to `MULTI_USER`.
+   - Updates `.env` with connection settings (except the password).
+5. `scripts/run_all.py` validates required files and installs dependencies.
+6. Runs `python -m pharmacystore.pipeline full` to extract data, build features, train models, and export artifacts.
 
-## Docker Restore Scripts
-Linux:
-- `restore_mssql_docker.sh` (root): does the full Docker restore
-- `scripts/restore_db.sh`: small wrapper used by `run_all.py`
+## Architecture overview
+```mermaid
+flowchart TD
+    A[SQL Server .bak] -->|Restore via Docker| B[Online DB]
+    B --> C[ETL extraction]
+    C --> D[Feature builders]
+    D --> E[Train/Validation splits]
+    E --> F[XGBoost model]
+    F --> G[Artifacts & metrics]
+```
 
-Windows:
-- `restore_mssql_docker.ps1` (root): should restore the `.bak` using Docker and accept `-DB_NAME`
+- **Extract**: pull core pharmacy tables from the restored SQL Server database.
+- **Transform**: derive calendar, holiday, price, and ATC-driven features with leakage-safe splits.
+- **Model**: train XGBoost with walk-forward evaluation and baselines; export metrics and serialized artifacts.
+- **Operate**: scripts wrap the workflow (`run_all.py`, `scripts/run_all.py`) with environment-driven settings.
 
-If you want a different database name, run the restore script directly with your name and update `.env`:
-- Linux: `bash restore_mssql_docker.sh MyDb`
-- Windows: `powershell -ExecutionPolicy Bypass -File .\restore_mssql_docker.ps1 -DB_NAME MyDb`
+## Manual commands
+- Build weekly features: `python -m pharmacystore.pipeline run`
+- Train main XGBoost: `python -m pharmacystore.pipeline train`
+- Train baseline XGBoost: `python -m pharmacystore.pipeline train-baseline`
+- Full pipeline: `python -m pharmacystore.pipeline full`
+- Optional run tag: append `--run-tag exp1` to training commands.
 
-## Required Input Files
-- Exactly one `.bak` file in `data/external/` (used by restore scripts)
-- `data/external/who_atc_ddd.csv`
-- `data/external/holidays/weekly_official_holidays.csv`
-- Optional: `data/external/holidays/persian_holidays.csv`
+Legacy scripts (still supported):
+- `python scripts/run_pipeline.py`
+- `python scripts/train_model.py`
+- `python scripts/train_baseline.py`
+- `python scripts/scale_sales.py`
+- `python scripts/classify_atc.py`
 
 ## Configuration (.env)
-The app reads `.env` automatically. See `.env.example` for a template.
+Set via environment or `.env` (see `.env.example`):
 
-Required keys:
+**Required**
 - `PHARMACYSTORE_SQL_SERVER`
 - `PHARMACYSTORE_SQL_DATABASE`
 - `PHARMACYSTORE_SQL_USERNAME`
 - `PHARMACYSTORE_SQL_PASSWORD`
 
-Defaults (when using Docker restore):
+**Defaults (Docker restore)**
 - `PHARMACYSTORE_SQL_SERVER=localhost,14333` (note the comma for port)
 - `PHARMACYSTORE_SQL_DATABASE=PharmacyStore`
 - `PHARMACYSTORE_SQL_USERNAME=sa`
@@ -79,63 +113,23 @@ Defaults (when using Docker restore):
 - `PHARMACYSTORE_SQL_ENCRYPT=false`
 - `PHARMACYSTORE_SQL_TRUST_CERT=true`
 
-Password handling:
-- Restore scripts do not write the password to `.env`.
-- `run_all.py` passes it via environment variables.
-- If you run the pipeline manually, export `PHARMACYSTORE_SQL_PASSWORD` yourself or add it to `.env`.
+Password handling: restore scripts never persist the password; `run_all.py` passes it via environment variables.
 
-## Repository Layout
-- `src/pharmacystore/`: core package
-- `scripts/`: runnable entry points
-- `restore_mssql_docker.sh`: Linux Docker restore
-- `restore_mssql_docker.ps1`: Windows Docker restore
-- `data/external/`: backup and reference data
-- `data/processed/`: generated outputs (gitignored)
-- `artifacts/`: trained models and artifacts (gitignored)
-- `artifacts/metrics/`: per-run metrics exports (gitignored)
-
-## Data Sources
-SQL Server tables used by the pipeline:
-- `dr_Drugs`: drug metadata and ATC codes
-- `dr_PrescriptionDetailLog`: prescription line items (PrID, DrugId, PacketQuantity, LogDateTime, SalePrice)
-- `dr_FactorDetail`: factor/price details for optional merges
-
-## Feature Engineering (Weekly)
+## Feature engineering
 - Weekly aggregation: `UPW = nunique(PrID)` per `DrugId` and `week_start` (Monday bucket).
-- Calendar features: week-of-year, month, quarter, start/end flags.
-- Holiday features: weekly official holiday count (if data is provided).
-- ATC classification: normalized ATC codes and grouping.
-- Sales/price categories: computed from a training subset to avoid leakage.
-- Rolling features: lagged UPW, rolling means/stds, trend and z-score features.
+- Calendar signals: week-of-year, month, quarter, start/end flags.
+- Holiday signals: weekly official holiday counts (if data provided).
+- ATC classification: normalized ATC codes and groupings.
+- Sales/price categories: derived on a training subset to avoid leakage.
+- Rolling stats: lagged UPW, rolling means/stds, trend, and z-scores.
 
-## Forecast Target & Evaluation
+## Forecast target & evaluation
 | Component | Standard |
 | --- | --- |
 | Target (UPW) | Weekly unique prescriptions per drug: `UPW = nunique(PrID)` aggregated by `DrugId` and `week_start`, filtered to `SalePrice > 0`. |
 | Time split | Train = oldest weeks, validation = middle weeks, test = newest weeks (70/15/15 by week). |
-| Baselines | Naive (last week), Moving average (last 4 weeks), Seasonal naive (t-52 weeks, if available). |
+| Baselines | Naive (last week), moving average (last 4 weeks), seasonal naive (t-52 weeks, if available). |
 | Metrics | MAE, RMSE, WAPE, sMAPE. |
-
-## Run (Manual)
-- Full pipeline (features + model training):
-  `python -m pharmacystore.pipeline full`
-- Build features and export weekly dataset:
-  `python -m pharmacystore.pipeline run`
-- Train the main XGBoost model:
-  `python -m pharmacystore.pipeline train`
-- Train the baseline XGBoost model:
-  `python -m pharmacystore.pipeline train-baseline`
-- Optional run tag to label artifacts:
-  `python -m pharmacystore.pipeline train --run-tag exp1`
-
-Legacy script entry points still work:
-- `python scripts/run_pipeline.py`
-- `python scripts/train_model.py`
-- `python scripts/train_baseline.py`
-- Scale sales categories:
-  `python scripts/scale_sales.py`
-- Preview ATC classification:
-  `python scripts/classify_atc.py`
 
 ## Outputs
 - `data/processed/weekly_features.csv`: weekly feature dataset.
@@ -143,23 +137,36 @@ Legacy script entry points still work:
 - `data/processed/upw_walkforward_predictions.csv`: walk-forward backtest (optional).
 - `data/processed/upw_fold_drift.csv`: drift diagnostics (train vs valid).
 - `artifacts/models/upw_xgb_model.json`: latest trained model.
-- `artifacts/runs/<run_id>/`: run-scoped configs, metrics, predictions, diagnostics.
+- `artifacts/runs/<run_id>/`: run configs, metrics, predictions, diagnostics.
 
 ## Reproducibility
 - Fixed seeds for numpy/random/xgboost via `PHARMACYSTORE_RANDOM_SEED`.
-- Each run writes artifacts to `artifacts/runs/<run_id>/` with:
-  `config.json`, `train_params.json`, `metrics.json`, `data_manifest.json`,
-  plus per-run predictions and model files.
-- Metrics are also exported to `artifacts/metrics/<run_id>/metrics.json`.
+- Each run writes to `artifacts/runs/<run_id>/` with `config.json`, `train_params.json`, `metrics.json`, `data_manifest.json`, and per-run outputs.
+- Metrics also exported to `artifacts/metrics/<run_id>/metrics.json`.
 - `data_manifest.json` records dataset hash and train/test week ranges.
 
-## Troubleshooting
-- pip SSL errors during install: check system time and CA certificates; try
-  `python -m pip install -U pip setuptools wheel`.
-- "Cannot open database ... (4060)": verify the Docker container is running and
-  the database name in `.env` matches the restored DB.
-- "No .bak file found": ensure exactly one `.bak` exists in `data/external/`.
-- Missing ODBC driver: install "ODBC Driver 18 for SQL Server" on the host.
+## Operational maturity checklist
+- [ ] Add CI with linting/type checks (e.g., `ruff`, `mypy`) and unit tests for feature builders and SQL client.
+- [ ] Introduce structured logging and runtime metrics to replace ad-hoc prints.
+- [ ] Add data-quality validation on extracted tables (schema + row-level guards).
+- [ ] Publish a model card summarizing data sources, assumptions, and evaluation splits.
+- [ ] Provide a minimal inference/demo notebook for stakeholders.
 
-## Data Privacy
-`data/processed/` and `artifacts/` are ignored by Git to keep sensitive outputs and model files out of the repository.
+## Troubleshooting
+- pip SSL errors: verify system time/CA certs; try `python -m pip install -U pip setuptools wheel`.
+- `Cannot open database ... (4060)`: ensure Docker container is running and `.env` DB name matches.
+- "No .bak file found": ensure exactly one `.bak` exists in `data/external/`.
+- Missing ODBC driver: install "ODBC Driver 18 for SQL Server" on host.
+
+## انتقال تغییرات به ریپوی اصلی
+برای اعمال تغییرات فعلی به ریپوی اصلی (upstream) می‌توانید این گام‌ها را دنبال کنید:
+1) از پاک بودن وضعیت فعلی مطمئن شوید: `git status -sb`.
+2) اگر remote اصلی را ندارید اضافه کنید: `git remote add upstream <url-ریپوی-اصلی>`.
+3) آخرین تغییرات اصلی را بگیرید: `git fetch upstream`.
+4) روی شاخه اصلی محلی بروید و آن را به‌روز کنید: `git checkout main` سپس `git merge upstream/main` (یا `git rebase upstream/main`).
+5) شاخه کاری فعلی را با main به‌روز کنید: `git checkout work` و `git rebase main`.
+6) بعد از حل تعارض‌ها، تغییرات را push کنید: `git push origin work -f` و سپس PR را به main باز کنید.
+
+## Credits & maintenance
+- Python >= 3.11, dependencies in `pyproject.toml` / `requirements.txt`.
+- Data and model artifacts are gitignored (`data/processed/`, `artifacts/`).
