@@ -21,8 +21,7 @@
 12. [Reproducibility](#reproducibility)
 13. [Operational maturity checklist](#operational-maturity-checklist)
 14. [Troubleshooting](#troubleshooting)
-15. [انتقال تغییرات به ریپوی اصلی](#انتقال-تغییرات-به-ریپوی-اصلی)
-16. [Credits & maintenance](#credits--maintenance)
+15. [Credits & maintenance](#credits--maintenance)
 
 ## Why it matters
 - Automates extraction from SQL Server backups and builds a repeatable training dataset.
@@ -158,14 +157,6 @@ Password handling: restore scripts never persist the password; `run_all.py` pass
 - "No .bak file found": ensure exactly one `.bak` exists in `data/external/`.
 - Missing ODBC driver: install "ODBC Driver 18 for SQL Server" on host.
 
-## انتقال تغییرات به ریپوی اصلی
-برای اعمال تغییرات فعلی به ریپوی اصلی (upstream) می‌توانید این گام‌ها را دنبال کنید:
-1) از پاک بودن وضعیت فعلی مطمئن شوید: `git status -sb`.
-2) اگر remote اصلی را ندارید اضافه کنید: `git remote add upstream <url-ریپوی-اصلی>`.
-3) آخرین تغییرات اصلی را بگیرید: `git fetch upstream`.
-4) روی شاخه اصلی محلی بروید و آن را به‌روز کنید: `git checkout main` سپس `git merge upstream/main` (یا `git rebase upstream/main`).
-5) شاخه کاری فعلی را با main به‌روز کنید: `git checkout work` و `git rebase main`.
-6) بعد از حل تعارض‌ها، تغییرات را push کنید: `git push origin work -f` و سپس PR را به main باز کنید.
 
 ## Credits & maintenance
 - Python >= 3.11, dependencies in `pyproject.toml` / `requirements.txt`.
