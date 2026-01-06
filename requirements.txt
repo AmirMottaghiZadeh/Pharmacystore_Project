@@ -1,0 +1,7 @@
+numpy
+pandas
+pydantic
+pydantic-settings
+pyodbc
+scikit-learn
+xgboost

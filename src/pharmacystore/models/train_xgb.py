@@ -1035,6 +1035,9 @@ def main(
     write_json(active_run_dir / "data_manifest.json", data_manifest)
     write_json(active_run_dir / "train_params.json", train_params)
     write_json(active_run_dir / "metrics.json", metrics_payload)
+    metrics_dir = artifacts_dir / "metrics" / active_run_dir.name
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    write_json(metrics_dir / "metrics.json", metrics_payload)
     return metrics_payload
 
 

@@ -18,6 +18,9 @@ dist/
 venv/
 environment/
 
+# Local environment files
+.env
+
 # Data and artifacts
 /data/processed/*
 !/data/processed/.gitkeep
@@ -25,6 +28,8 @@ environment/
 !/data/raw/.gitkeep
 /data/interim/*
 !/data/interim/.gitkeep
+/data/external/*.bak
+/data/external/*.tebyanbak
 /artifacts/*
 !/artifacts/.gitkeep
 /artifacts/models/*
