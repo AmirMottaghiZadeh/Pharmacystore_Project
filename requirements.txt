@@ -5,3 +5,5 @@ pydantic-settings
 pyodbc
 scikit-learn
 xgboost
+pytest
+flake8
