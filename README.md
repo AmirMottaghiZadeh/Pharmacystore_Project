@@ -1,6 +1,6 @@
 # 🏥 PharmacyStore Forecasting
 
-> End-to-end pipeline to forecast weekly unique prescriptions (UPW) for Iranian pharmacies using XGBoost on tabular data.
+> End-to-end pipeline to forecast weekly unique prescriptions (UPW) for Iranian pharmacies using XGBoost on tabular data Extracted from Tebyanback File **(Tebyan Pharmacy Management Software Backup File)**.
 
 ![Python](https://img.shields.io/badge/Python-3.11+-blue)
 ![Database](https://img.shields.io/badge/SQL%20Server-Dockerized%20restore-4E8A08)
@@ -32,7 +32,7 @@
 > ⚠️ **For stable generalization, plan for a minimum of three years of pharmacy transaction data** (prescriptions, prices, ATC metadata, and holiday calendars). Shorter horizons (e.g., the current 10-month sample) limit the ability to model seasonality and rare drugs effectively.
 
 Required external files:
-- Exactly one `.bak` file in `data/external/` (restored into SQL Server).
+- Exactly one `.bak`  or `.tebyanback` file in `data/external/` (restored into SQL Server).
 - `data/external/who_atc_ddd.csv`.
 - `data/external/holidays/weekly_official_holidays.csv`.
 - Optional: `data/external/holidays/persian_holidays.csv`.
@@ -44,7 +44,7 @@ Required external files:
 - `data/processed/`, `artifacts/`: generated datasets, trained models, per-run metrics (gitignored).
 
 ## Quick start
-1. Place exactly one `.bak` in `data/external/`.
+1. Place exactly one `.bak` or `.tebyanback` in `data/external/`.
 2. Run `python run_all.py`.
 3. When prompted, enter the SQL Server SA password (not stored on disk).
 4. Outputs land in `data/processed/` and `artifacts/`.
@@ -68,7 +68,7 @@ Required external files:
 ## Architecture overview
 ```mermaid
 flowchart TD
-    A[SQL Server .bak] -->|Restore via Docker| B[Online DB]
+    A[SQL Server .bak/tebyanback] -->|Restore via Docker| B[Online DB]
     B --> C[ETL extraction]
     C --> D[Feature builders]
     D --> E[Train/Validation splits]
