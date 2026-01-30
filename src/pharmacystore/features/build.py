@@ -280,10 +280,12 @@ def add_weekly_rolling_features(weekly_df: pd.DataFrame, epsilon: float = 1e-6) 
         g["UPW_lag6"] = g["UPW"].shift(6)
         lag_series = g["UPW_lag1"]
 
+        g["UPW_rollmean_2"] = lag_series.rolling(window=2, min_periods=2).mean()
         g["UPW_rollmean_4"] = lag_series.rolling(window=4, min_periods=4).mean()
         g["UPW_rollmean_8"] = lag_series.rolling(window=8, min_periods=8).mean()
         g["UPW_rollmean_12"] = lag_series.rolling(window=12, min_periods=12).mean()
         g["UPW_rollmean_52"] = lag_series.rolling(window=52, min_periods=26).mean()
+        g["UPW_rollstd_3"] = lag_series.rolling(window=3, min_periods=3).std()
         g["UPW_rollstd_8"] = lag_series.rolling(window=8, min_periods=8).std()
         g["UPW_rollmax_8"] = lag_series.rolling(window=8, min_periods=8).max()
 
@@ -309,10 +311,12 @@ def add_weekly_rolling_features(weekly_df: pd.DataFrame, epsilon: float = 1e-6) 
             "UPW_lag1",
             "UPW_lag2",
             "UPW_lag4",
+            "UPW_rollmean_2",
             "UPW_rollmean_4",
             "UPW_rollmean_8",
             "UPW_rollmean_12",
             "UPW_rollmax_8",
+            "UPW_rollstd_3",
             "UPW_rollstd_8",
             "weeks_since_peak_13",
             "diff_rate",
