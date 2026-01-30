@@ -18,6 +18,9 @@ from pharmacystore.pipeline import run_pipeline
 from pharmacystore.run_utils import compute_file_hash, create_run_dir, set_global_seed, write_json
 
 
+ENABLE_SPIKE_POLICY = False
+
+
 def build_dataset(settings: Settings | None = None) -> pd.DataFrame:
     """Build the full weekly feature set via the existing pipeline."""
     weekly_df = run_pipeline(settings=settings)
@@ -41,6 +44,16 @@ def _iso_range(series: pd.Series) -> dict[str, str | None]:
         "min": values.min().date().isoformat(),
         "max": values.max().date().isoformat(),
     }
+
+
+def _ensure_week_start_ts(meta: pd.DataFrame) -> pd.DataFrame:
+    if "week_start_ts" in meta.columns:
+        return meta
+    if "week_start" not in meta.columns:
+        raise KeyError("week_start_ts missing from meta and cannot derive from week_start.")
+    meta = meta.copy()
+    meta["week_start_ts"] = pd.to_datetime(meta["week_start"]).astype("int64") // 10**9
+    return meta
 
 
 def _write_dual_csv(df: pd.DataFrame, run_path: Path, latest_path: Path) -> None:
@@ -98,6 +111,174 @@ def _split_weeks(
     if len(test_weeks) == 0:
         raise ValueError("Test split is empty; adjust split fractions.")
     return train_weeks, valid_weeks, test_weeks
+
+
+def _three_year_split(
+    meta: pd.DataFrame,
+    min_valid_weeks: int = 4,
+    min_test_weeks: int = 4,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Year-based split: years 1-2 train, year 3 H1 valid, year 3 H2 test."""
+    weeks_df = meta[["week_start_ts", "week_start"]].drop_duplicates().sort_values("week_start_ts")
+    if weeks_df.empty:
+        raise ValueError("No weekly information available for splitting.")
+
+    week_dates = pd.to_datetime(weeks_df["week_start"])
+    base_year = int(week_dates.min().year)
+    weeks_df["rel_year"] = week_dates.dt.year - base_year + 1
+    weeks_df["month"] = week_dates.dt.month
+
+    train_weeks = weeks_df.loc[weeks_df["rel_year"].isin([1, 2]), "week_start_ts"].to_numpy()
+    valid_weeks = weeks_df.loc[(weeks_df["rel_year"] == 3) & (weeks_df["month"] <= 6), "week_start_ts"].to_numpy()
+    test_weeks = weeks_df.loc[(weeks_df["rel_year"] == 3) & (weeks_df["month"] >= 7), "week_start_ts"].to_numpy()
+
+    if len(valid_weeks) < min_valid_weeks or len(test_weeks) < min_test_weeks or len(train_weeks) == 0:
+        return _split_weeks(meta, train_frac=0.7, valid_frac=0.15)
+
+    return train_weeks, valid_weeks, test_weeks
+
+
+def compute_sample_weights(
+    meta: pd.DataFrame,
+    y: pd.Series,
+    train_mask: np.ndarray,
+    half_life_weeks: int = 26,
+    min_drug_weight: float = 0.6,
+    max_drug_weight: float = 2.0,
+) -> np.ndarray:
+    """Combine time-decay and volume weights; downweight censored rows if present."""
+    if len(meta) == 0:
+        return np.array([])
+
+    # Time decay (recent weeks get higher weight)
+    weeks_sorted = np.sort(meta["week_start_ts"].unique())
+    week_rank = {wk: i for i, wk in enumerate(weeks_sorted)}
+    max_rank = max(week_rank.values()) if week_rank else 0
+    decay = np.log(2) / max(half_life_weeks, 1)
+    time_weight = meta["week_start_ts"].map(
+        lambda wk: float(np.exp(decay * (week_rank[wk] - max_rank)))
+    ).to_numpy()
+
+    # Volume weight based on train history only
+    train_meta = meta.loc[train_mask].reset_index(drop=True)
+    train_y = y.loc[train_mask].reset_index(drop=True)
+    drug_totals = train_y.groupby(train_meta["DrugId"]).sum()
+    median_total = float(drug_totals.median()) if not drug_totals.empty else 1.0
+    drug_scale = (drug_totals / max(median_total, 1e-6)) ** 0.5
+    drug_scale = drug_scale.clip(lower=min_drug_weight, upper=max_drug_weight)
+    drug_weight = meta["DrugId"].map(drug_scale).fillna(1.0).to_numpy()
+
+    weights = time_weight * drug_weight
+
+    # Optional censored flag
+    for col in ["censored_flag", "stockout_flag", "is_censored"]:
+        if col in meta.columns:
+            weights = np.where(meta[col].fillna(0).to_numpy() > 0, weights * 0.5, weights)
+            break
+
+    return weights
+
+
+def _select_baseline_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Pick stable, low-variance features for the baseline stage."""
+    preferred = [
+        "UPW_lag1",
+        "UPW_lag2",
+        "UPW_lag4",
+        "UPW_rollmean_4",
+        "UPW_rollmean_8",
+        "UPW_rollmean_12",
+        "UPW_rollmax_8",
+        "UPW_rollstd_8",
+        "weeks_since_peak_13",
+        "week_of_year",
+        "month",
+        "official_holiday_days",
+    ]
+    cols = [c for c in preferred if c in df.columns]
+    if not cols:
+        cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    return df[cols].copy().fillna(0)
+
+
+def audit_feature_leakage(
+    df: pd.DataFrame,
+    output_path: Path | None = None,
+    epsilon: float = 1e-6,
+) -> pd.DataFrame:
+    """Recompute rolling features from lagged UPW and report mismatches."""
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+    required = {"DrugId", "week_start", "UPW"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Leakage audit requires columns: {sorted(missing)}")
+
+    work = df.copy().sort_values(["DrugId", "week_start"]).reset_index(drop=True)
+    work["week_of_year"] = pd.to_datetime(work["week_start"]).dt.isocalendar().week.astype(int)
+    rows = []
+
+    def _recompute(group: pd.DataFrame) -> pd.DataFrame:
+        g = group.sort_values("week_start").copy()
+        lag_series = g["UPW"].shift(1)
+        g["UPW_rollmean_4_chk"] = lag_series.rolling(window=4, min_periods=4).mean()
+        g["UPW_rollmean_8_chk"] = lag_series.rolling(window=8, min_periods=8).mean()
+        g["UPW_rollmean_12_chk"] = lag_series.rolling(window=12, min_periods=12).mean()
+        g["UPW_rollmean_52_chk"] = lag_series.rolling(window=52, min_periods=26).mean()
+        g["UPW_rollmax_8_chk"] = lag_series.rolling(window=8, min_periods=8).max()
+        g["UPW_rollstd_8_chk"] = lag_series.rolling(window=8, min_periods=8).std()
+        g["diff_rate_chk"] = lag_series.pct_change()
+        roll_mean_12 = lag_series.rolling(window=12, min_periods=12).mean()
+        roll_std_12 = lag_series.rolling(window=12, min_periods=12).std()
+        g["Z_score_chk"] = (lag_series - roll_mean_12) / (roll_std_12 + epsilon)
+        g["weeks_since_peak_13_chk"] = (
+            lag_series.rolling(window=13, min_periods=4).apply(
+                lambda s: len(s) - 1 - int(np.argmax(s.values))
+            )
+        )
+        g["spike_score_8_chk"] = (lag_series - g["UPW_rollmean_8_chk"]) / (g["UPW_rollstd_8_chk"] + epsilon)
+        g["diff_rate_chk"] = g["diff_rate_chk"].clip(lower=-3, upper=3)
+        g["Z_score_chk"] = g["Z_score_chk"].clip(lower=-3, upper=3)
+        regime_raw = ((g["week_of_year"] <= 8) | (g["week_of_year"] >= 45)).astype(float)
+        regime_lag = regime_raw.shift(1)
+        g["regime_prob_8w_chk"] = regime_lag.rolling(window=8, min_periods=4).mean()
+        g["spike_flag_chk"] = (
+            (lag_series > 1.5 * (g["UPW_rollmean_12_chk"] + epsilon)) | (g["diff_rate_chk"] > 1.0)
+        ).astype(int)
+        return g
+
+    audit = work.groupby("DrugId", group_keys=False).apply(_recompute, include_groups=False)
+    feature_pairs = {
+        "UPW_rollmean_4": "UPW_rollmean_4_chk",
+        "UPW_rollmean_8": "UPW_rollmean_8_chk",
+        "UPW_rollmean_12": "UPW_rollmean_12_chk",
+        "UPW_rollmean_52": "UPW_rollmean_52_chk",
+        "UPW_rollmax_8": "UPW_rollmax_8_chk",
+        "UPW_rollstd_8": "UPW_rollstd_8_chk",
+        "diff_rate": "diff_rate_chk",
+        "Z_score": "Z_score_chk",
+        "weeks_since_peak_13": "weeks_since_peak_13_chk",
+        "spike_score_8": "spike_score_8_chk",
+    }
+    for col, chk in feature_pairs.items():
+        if col not in audit.columns or chk not in audit.columns:
+            continue
+        lhs = audit[col].round(2)
+        rhs = audit[chk].round(2)
+        diff = (lhs - rhs).abs()
+        mismatch = diff > 1e-2
+        rows.append(
+            {
+                "feature": col,
+                "max_abs_diff": float(diff.max(skipna=True)) if not diff.dropna().empty else 0.0,
+                "mismatch_count": int(mismatch.sum()),
+            }
+        )
+    report = pd.DataFrame(rows).sort_values(["mismatch_count", "max_abs_diff"], ascending=False)
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        report.to_csv(output_path, index=False)
+    return report
 
 
 def _baseline_predictions(
@@ -159,28 +340,32 @@ def prepare_features(df: pd.DataFrame):
     # Convert date to numeric timestamp (seconds since epoch)
     data["week_start_ts"] = pd.to_datetime(data["week_start"]).astype("int64") // 10**9
 
-    # Seasonality encoding with normalized sin/cos
     week_num = data["week_of_year"]
-    data["week_sin"] = np.sin(2 * np.pi * week_num / 52)
-    data["week_cos"] = np.cos(2 * np.pi * week_num / 52)
-    if "week_sinus" in data.columns:
-        data = data.drop(columns=["week_sinus"])
 
     # Ensure lagged target exists (built upstream, but recompute defensively)
     if "UPW_lag1" not in data.columns:
         data["UPW_lag1"] = data.groupby("DrugId")["UPW"].shift(1)
 
-    # Trend features strictly on lagged series (no UPW_t leakage)
+    # Ensure safe rolling stats exist (lagged only)
     lag_series = data["UPW_lag1"]
-    short_roll = lag_series.rolling(window=4, min_periods=4).mean()
-    long_roll = lag_series.rolling(window=12, min_periods=12).mean()
-    data["UPW_rollmean_12"] = long_roll
-    data["trend_short_vs_long"] = short_roll - long_roll
-    data["trend_slope_8w"] = lag_series.rolling(window=8, min_periods=8).mean().diff()
-    data["trend_accel"] = data["trend_slope_8w"].diff()
+    if "UPW_rollmean_4" not in data.columns:
+        data["UPW_rollmean_4"] = lag_series.rolling(window=4, min_periods=4).mean()
+    if "UPW_rollmean_8" not in data.columns:
+        data["UPW_rollmean_8"] = lag_series.rolling(window=8, min_periods=8).mean()
+    if "UPW_rollmean_12" not in data.columns:
+        data["UPW_rollmean_12"] = lag_series.rolling(window=12, min_periods=12).mean()
+    if "UPW_rollmax_8" not in data.columns:
+        data["UPW_rollmax_8"] = lag_series.rolling(window=8, min_periods=8).max()
+    if "UPW_rollstd_8" not in data.columns:
+        data["UPW_rollstd_8"] = lag_series.rolling(window=8, min_periods=8).std()
+    if "weeks_since_peak_13" not in data.columns:
+        data["weeks_since_peak_13"] = (
+            lag_series.rolling(window=13, min_periods=4)
+            .apply(lambda s: len(s) - 1 - int(np.argmax(s.values)))
+        )
 
-    # Regime flag for start/end of year (helps separate regimes)
-    data["regime_flag"] = ((week_num <= 8) | (week_num >= 45)).astype(int)
+    # Spike score for policy use (not model feature)
+    data["spike_score_8"] = (lag_series - data["UPW_rollmean_8"]) / (data["UPW_rollstd_8"] + 1e-6)
 
     # Drop rows without sufficient lag history
     data = data.replace([np.inf, -np.inf], np.nan)
@@ -188,20 +373,14 @@ def prepare_features(df: pd.DataFrame):
         col
         for col in [
             "UPW_lag1",
-            "UPW_rollmean_2",
+            "UPW_lag2",
+            "UPW_lag4",
             "UPW_rollmean_4",
-            "UPW_rollmean_6",
-            "UPW_rollstd_3",
-            "UPW_rollstd_6",
-            "UPW_rollmin",
-            "UPW_rollmax",
-            "diff_rate",
-            "avg_point",
-            "Z_score",
+            "UPW_rollmean_8",
             "UPW_rollmean_12",
-            "trend_short_vs_long",
-            "trend_slope_8w",
-            "trend_accel",
+            "UPW_rollmax_8",
+            "UPW_rollstd_8",
+            "weeks_since_peak_13",
         ]
         if col in data.columns
     ]
@@ -218,7 +397,11 @@ def prepare_features(df: pd.DataFrame):
             "brandname",
             "saleCategory",
             "priceCategory",
-            "regime_flag",
+            "UPW_rollmean_8",
+            "UPW_rollstd_8",
+            "UPW_rollmax_8",
+            "weeks_since_peak_13",
+            "spike_score_8",
             "quarter",
         ]
         if col in data.columns
@@ -227,7 +410,6 @@ def prepare_features(df: pd.DataFrame):
 
     # Target and features
     y = data["UPW"].astype(float)
-    # Drop target and any aggregates/categories derived from full-history UPW to avoid leakage
     drop_target_like = [
         "UPW",
         "UniquePackets",
@@ -238,8 +420,41 @@ def prepare_features(df: pd.DataFrame):
         "priceCategory",
         "Scale",
         "PriceScale",
+        "diff_rate",
+        "Z_score",
+        "trend_short_vs_long",
+        "trend_slope_8w",
+        "trend_accel",
+        "trend_slope_8w_norm",
+        "pct_trend_8w",
+        "seasonality_strength_8w",
+        "regime_prob_8w",
+        "week_sin",
+        "week_cos",
+        "spike_flag",
+        "spike_score_8",
     ]
-    X = data.drop(columns=[c for c in drop_target_like if c in data.columns])
+    X_full = data.drop(columns=[c for c in drop_target_like if c in data.columns])
+    safe_features = [
+        "UPW_lag1",
+        "UPW_lag2",
+        "UPW_lag4",
+        "UPW_rollmean_4",
+        "UPW_rollmean_8",
+        "UPW_rollmean_12",
+        "UPW_rollmax_8",
+        "UPW_rollstd_8",
+        "weeks_since_peak_13",
+        "week_of_year",
+        "month",
+        "official_holiday_days",
+        "quarter",
+    ]
+    categorical_cols = [
+        c for c in X_full.columns if X_full[c].dtype == "object" or str(X_full[c].dtype).startswith("category")
+    ]
+    keep_cols = [c for c in safe_features if c in X_full.columns] + categorical_cols
+    X = X_full[keep_cols].copy()
 
     return X, y, meta
 
@@ -293,20 +508,21 @@ def train_xgb_model(
     train_frac: float = 0.7,
     valid_frac: float = 0.15,
 ):
-    """Train/validate an XGBoost regressor using a time-based split."""
-    # Time-based ordering to avoid leakage
-    order = np.argsort(X["week_start_ts"].values)
+    """Champion training: raw target + weights + safe features (no two-stage, no shock in-model)."""
+    meta = _ensure_week_start_ts(meta)
+    order = np.argsort(meta["week_start_ts"].values)
     X_ordered = X.iloc[order].reset_index(drop=True)
     y_ordered = y.iloc[order].reset_index(drop=True)
     meta_ordered = meta.iloc[order].reset_index(drop=True)
-    weights_ordered = np.linspace(0.7, 1.3, len(X_ordered))
 
-    train_weeks, valid_weeks, test_weeks = _split_weeks(
-        meta_ordered, train_frac=train_frac, valid_frac=valid_frac
+    train_weeks, valid_weeks, test_weeks = _three_year_split(
+        meta_ordered, min_valid_weeks=4, min_test_weeks=4
     )
     train_mask = meta_ordered["week_start_ts"].isin(train_weeks).to_numpy()
     valid_mask = meta_ordered["week_start_ts"].isin(valid_weeks).to_numpy()
     test_mask = meta_ordered["week_start_ts"].isin(test_weeks).to_numpy()
+
+    weights_ordered = compute_sample_weights(meta_ordered, y_ordered, train_mask=train_mask)
 
     X_train_raw = X_ordered.loc[train_mask].reset_index(drop=True)
     X_valid_raw = X_ordered.loc[valid_mask].reset_index(drop=True)
@@ -332,12 +548,12 @@ def train_xgb_model(
         "objective": "reg:squarederror",
         "eval_metric": ["rmse", "mae"],
         "eta": 0.05,
-        "max_depth": 4,  # shallower tree to reduce variance
+        "max_depth": 5,
         "subsample": 0.8,
         "colsample_bytree": 0.8,
-        "min_child_weight": 6.0,  # higher to control overfitting
-        "gamma": 0.4,  # minimum loss reduction to make a split
-        "reg_lambda": 1.0,
+        "min_child_weight": 8.0,
+        "gamma": 0.4,
+        "reg_lambda": 2.0,
         "reg_alpha": 0.1,
     }
     if random_seed is not None:
@@ -347,15 +563,15 @@ def train_xgb_model(
     model = xgb.train(
         params=active_params,
         dtrain=train_dm,
-        num_boost_round=300,  # ~250-300 as requested
+        num_boost_round=250,
         evals=evals,
-        early_stopping_rounds=40,
-        verbose_eval=50,
+        early_stopping_rounds=35,
+        verbose_eval=False,
     )
 
-    preds_train = model.predict(train_dm)
-    preds_valid = model.predict(valid_dm)
-    preds_test = model.predict(test_dm)
+    preds_train = np.clip(model.predict(train_dm), 0, None)
+    preds_valid = np.clip(model.predict(valid_dm), 0, None)
+    preds_test = np.clip(model.predict(test_dm), 0, None)
 
     # Top feature importances
     importance = model.get_score(importance_type="gain")
@@ -384,15 +600,28 @@ def time_series_cv(
     X: pd.DataFrame,
     y: pd.Series,
     params: dict,
+    meta: pd.DataFrame | None = None,
     n_splits: int = 3,
     num_boost_round: int = 300,
     early_stopping_rounds: int = 40,
 ) -> list[dict[str, float]]:
-    """Perform time-series cross-validation and return metrics per fold."""
-    order = np.argsort(X["week_start_ts"].values)
-    X_ordered = X.iloc[order].reset_index(drop=True)
-    y_ordered = y.iloc[order].reset_index(drop=True)
-    week_vals = X_ordered["week_start_ts"].to_numpy()
+    """Time-series CV for champion model (raw target, safe features)."""
+    if meta is None:
+        if "week_start_ts" not in X.columns or "DrugId" not in X.columns:
+            raise KeyError("time_series_cv requires week_start_ts and DrugId in X or a meta DataFrame.")
+        order = np.argsort(X["week_start_ts"].values)
+        X_ordered = X.iloc[order].reset_index(drop=True)
+        y_ordered = y.iloc[order].reset_index(drop=True)
+        meta_ordered = X_ordered[["week_start_ts", "DrugId"]].copy()
+    else:
+        meta = _ensure_week_start_ts(meta)
+        order = np.argsort(meta["week_start_ts"].values)
+        X_ordered = X.iloc[order].reset_index(drop=True)
+        y_ordered = y.iloc[order].reset_index(drop=True)
+        meta_ordered = meta.iloc[order].reset_index(drop=True)
+        if "DrugId" not in meta_ordered.columns:
+            raise KeyError("time_series_cv requires DrugId in meta.")
+    week_vals = meta_ordered["week_start_ts"].to_numpy()
     weeks = np.sort(np.unique(week_vals))
     if len(weeks) <= n_splits:
         raise ValueError("Not enough unique weeks for time-series CV.")
@@ -406,15 +635,15 @@ def time_series_cv(
         train_mask = np.isin(week_vals, train_weeks)
         valid_mask = np.isin(week_vals, valid_weeks)
 
-        X_train, X_valid = X_ordered.loc[train_mask], X_ordered.loc[valid_mask]
-        y_train, y_valid = y_ordered.loc[train_mask], y_ordered.loc[valid_mask]
-        weights = np.linspace(0.7, 1.3, len(X_ordered))
-        w_train, w_valid = weights[train_mask], weights[valid_mask]
+        X_train_raw, X_valid_raw = X_ordered.loc[train_mask], X_ordered.loc[valid_mask]
+        y_train_raw, y_valid_raw = y_ordered.loc[train_mask], y_ordered.loc[valid_mask]
+        w_all = compute_sample_weights(meta_ordered, y_ordered, train_mask=train_mask)
+        w_train, w_valid = w_all[train_mask], w_all[valid_mask]
 
-        X_train_enc, X_valid_enc, _ = encode_categoricals(X_train, X_valid)
+        X_train_enc, X_valid_enc, _ = encode_categoricals(X_train_raw, X_valid_raw)
 
-        train_dm = xgb.DMatrix(X_train_enc, label=y_train, weight=w_train)
-        valid_dm = xgb.DMatrix(X_valid_enc, label=y_valid, weight=w_valid)
+        train_dm = xgb.DMatrix(X_train_enc, label=y_train_raw, weight=w_train)
+        valid_dm = xgb.DMatrix(X_valid_enc, label=y_valid_raw, weight=w_valid)
         evals = [(train_dm, "train"), (valid_dm, "valid")]
 
         booster = xgb.train(
@@ -425,8 +654,9 @@ def time_series_cv(
             early_stopping_rounds=early_stopping_rounds,
             verbose_eval=False,
         )
-        preds = booster.predict(valid_dm)
-        metrics = evaluate_predictions(y_valid, preds, label=f"fold_{fold}")
+        preds = np.clip(booster.predict(valid_dm), 0, None)
+
+        metrics = evaluate_predictions(y_valid_raw, preds, label=f"fold_{fold}")
         fold_metrics.append(metrics)
         print(
             f"Fold {fold}: RMSE={metrics['rmse']:.3f} | MAE={metrics['mae']:.3f} | "
@@ -485,26 +715,83 @@ def apply_regime_calibration(
     y_train: pd.Series,
     preds_train: np.ndarray,
     meta_train: pd.DataFrame,
-    regime_col: str = "regime_flag",
+    regime_col: str | None = None,
     recent_window: int = 8,
 ) -> np.ndarray:
-    """Bias-correct predictions per regime; no global bias fallback."""
-    bias_map: dict = {}
+    """Bias-correct predictions; optionally conditioned on a soft regime column."""
     residuals_train = preds_train - y_train
-    if regime_col in meta_train.columns:
-        for regime, idx in meta_train.groupby(regime_col).groups.items():
-            bias_map[regime] = float(np.mean(residuals_train[idx]))
-
     recent_bias = float(residuals_train.tail(recent_window).mean()) if len(residuals_train) else 0.0
 
-    if regime_col in meta_valid.columns and bias_map:
-        adj = [
-            bias_map.get(meta_valid.iloc[i][regime_col], recent_bias)
-            for i in range(len(meta_valid))
-        ]
-        return preds + np.array(adj)
+    if regime_col and regime_col in meta_train.columns and regime_col in meta_valid.columns:
+        # Bin soft regime into deciles to avoid over-fragmentation
+        def _bin(series: pd.Series) -> pd.Series:
+            return (series.fillna(0) * 10).round().clip(0, 10)
+
+        train_bins = _bin(meta_train[regime_col])
+        valid_bins = _bin(meta_valid[regime_col])
+        bias_map = {
+            bin_val: float(residuals_train[train_bins == bin_val].mean())
+            for bin_val in np.unique(train_bins)
+        }
+        adj = np.array([bias_map.get(b, recent_bias) for b in valid_bins])
+        return preds + adj
 
     return preds + recent_bias
+
+
+def apply_shock_guard(
+    preds: np.ndarray,
+    base_pred: np.ndarray,
+    X_raw: pd.DataFrame,
+    diff_threshold: float = 2.5,
+    z_threshold: float = 2.5,
+    peak_scale: float = 1.1,
+) -> np.ndarray:
+    """Override predictions during detected shocks using baseline and recent peak."""
+    preds_adj = np.array(preds, copy=True)
+    base_arr = np.asarray(base_pred)
+    diff = X_raw.get("diff_rate")
+    zscore = X_raw.get("Z_score")
+    spike_score = X_raw.get("spike_score_8")
+    if diff is None and zscore is None and spike_score is None:
+        return np.clip(preds_adj, 0, None)
+    mask = np.zeros(len(preds_adj), dtype=bool)
+    if diff is not None:
+        mask |= diff.abs().to_numpy() > diff_threshold
+    if zscore is not None:
+        mask |= zscore.abs().to_numpy() > z_threshold
+    if spike_score is not None:
+        mask |= spike_score.abs().to_numpy() > z_threshold
+    if not mask.any():
+        return np.clip(preds_adj, 0, None)
+    peak = X_raw.get("UPW_rollmax_8", pd.Series(0, index=X_raw.index)).fillna(0).to_numpy()
+    candidate = np.maximum(base_arr, peak_scale * peak)
+    preds_adj[mask] = np.maximum(preds_adj[mask], candidate[mask])
+    return np.clip(preds_adj, 0, None)
+
+
+def summarize_walkforward_fold1(
+    wf_df: pd.DataFrame,
+    meta: pd.DataFrame,
+    output_path: Path | None = None,
+) -> pd.DataFrame:
+    """Summarize the first walk-forward week and its drug composition."""
+    if wf_df.empty:
+        return pd.DataFrame()
+    first_week = wf_df["week_start_ts"].min()
+    fold1 = wf_df[wf_df["week_start_ts"] == first_week].copy()
+    first_seen = meta.groupby("DrugId")["week_start_ts"].min()
+    fold1["is_new_drug"] = fold1["DrugId"].map(first_seen) == first_week
+    fold1 = fold1.sort_values("abs_err", ascending=False)
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fold1.to_csv(output_path, index=False)
+    print(
+        "\n=== Walk-forward Fold1 summary ===\n"
+        f"Week_ts={int(first_week)} | Drugs={fold1['DrugId'].nunique()} | "
+        f"New drugs={int(fold1['is_new_drug'].sum())} | Top abs_err={fold1['abs_err'].max():.3f}"
+    )
+    return fold1
 
 
 def monitor_rolling_rmse(y_true: pd.Series, y_pred: np.ndarray, window: int = 8) -> None:
@@ -531,26 +818,26 @@ def walk_forward_forecast(
     error_window: int = 8,
     output_path: str = "data/processed/upw_walkforward_predictions.csv",
 ) -> tuple[pd.DataFrame, dict[str, float]]:
-    """Rolling-origin training: for each week, fit on past weeks and track rolling error bands."""
+    """Rolling-origin training for champion model (raw target, safe features)."""
     if params is None:
         params = {
             "objective": "reg:squarederror",
             "eval_metric": ["rmse", "mae"],
             "eta": 0.05,
-            "max_depth": 4,
+            "max_depth": 5,
             "subsample": 0.8,
             "colsample_bytree": 0.8,
-            "min_child_weight": 6.0,
+            "min_child_weight": 8.0,
             "gamma": 0.4,
-            "reg_lambda": 1.0,
+            "reg_lambda": 2.0,
             "reg_alpha": 0.1,
         }
 
-    order = np.argsort(X["week_start_ts"].values)
+    meta = _ensure_week_start_ts(meta)
+    order = np.argsort(meta["week_start_ts"].values)
     X_ordered = X.iloc[order].reset_index(drop=True)
     y_ordered = y.iloc[order].reset_index(drop=True)
     meta_ordered = meta.iloc[order].reset_index(drop=True)
-    weights_ordered = np.linspace(0.7, 1.3, len(X_ordered))
 
     unique_weeks = np.sort(meta_ordered["week_start_ts"].unique())
     start_idx = min_train_weeks
@@ -568,8 +855,8 @@ def walk_forward_forecast(
         if len(X_train_all) < 2:
             continue
         y_train_all = y_ordered.loc[train_mask].reset_index(drop=True)
-        meta_train_all = meta_ordered.loc[train_mask].reset_index(drop=True)
-        w_train_all = weights_ordered[train_mask]
+        weights_all = compute_sample_weights(meta_ordered, y_ordered, train_mask=train_mask)
+        w_train_all = weights_all[train_mask]
 
         inner_split = max(int(len(X_train_all) * 0.85), len(X_train_all) - 150)
         inner_split = min(max(inner_split, 1), len(X_train_all) - 1)
@@ -580,7 +867,9 @@ def walk_forward_forecast(
         w_inner_train = w_train_all[:inner_split]
         w_inner_valid = w_train_all[inner_split:]
 
-        X_inner_train, X_inner_valid, encoders = encode_categoricals(X_inner_train_raw, X_inner_valid_raw)
+        X_inner_train, X_inner_valid, encoders = encode_categoricals(
+            X_inner_train_raw, X_inner_valid_raw
+        )
         train_dm = xgb.DMatrix(X_inner_train, label=y_inner_train, weight=w_inner_train)
         valid_dm = xgb.DMatrix(X_inner_valid, label=y_inner_valid, weight=w_inner_valid)
         booster = xgb.train(
@@ -592,29 +881,37 @@ def walk_forward_forecast(
             verbose_eval=False,
         )
 
-        # Bias calibration uses full in-sample residuals
-        train_full_enc = apply_label_encoders(X_train_all, encoders)
-        train_full_dm = xgb.DMatrix(train_full_enc, label=y_train_all, weight=w_train_all)
-        preds_train_full = booster.predict(train_full_dm)
-
         X_valid_raw = X_ordered.loc[valid_mask].reset_index(drop=True)
         y_valid = y_ordered.loc[valid_mask].reset_index(drop=True)
         meta_valid = meta_ordered.loc[valid_mask].reset_index(drop=True)
         X_valid_enc = apply_label_encoders(X_valid_raw, encoders)
         valid_dm = xgb.DMatrix(X_valid_enc)
 
-        preds_valid = booster.predict(valid_dm)
-        preds_valid_cal = apply_regime_calibration(
-            preds_valid, meta_valid, y_train_all, preds_train_full, meta_train_all
-        )
+        preds_valid = np.clip(booster.predict(valid_dm), 0, None)
 
         week_df = meta_valid.copy()
         if "week_start_ts" not in week_df.columns and "week_start_ts" in X_valid_raw.columns:
             week_df["week_start_ts"] = X_valid_raw["week_start_ts"].values
+        feature_cols = [
+            "UPW_lag1",
+            "UPW_rollmean_4",
+            "UPW_rollmean_8",
+            "UPW_rollmean_12",
+            "UPW_rollmax_8",
+            "UPW_rollstd_8",
+            "weeks_since_peak_13",
+            "spike_score_8",
+        ]
+        keep_cols = [c for c in feature_cols if c in X_valid_raw.columns]
+        if keep_cols:
+            week_df = pd.concat(
+                [week_df.reset_index(drop=True), X_valid_raw[keep_cols].reset_index(drop=True)],
+                axis=1,
+            )
         week_df["y_true"] = y_valid.values
         week_df["y_pred"] = preds_valid
-        week_df["y_pred_cal"] = preds_valid_cal
-        week_df["abs_err"] = np.abs(week_df["y_pred_cal"] - week_df["y_true"])
+        week_df["y_pred_cal"] = preds_valid
+        week_df["abs_err"] = np.abs(week_df["y_pred"] - week_df["y_true"])
         rows.append(week_df)
 
     if not rows:
@@ -635,14 +932,24 @@ def walk_forward_forecast(
     )
     wf_df["error_rate_roll"] = wf_df["rolling_mae"] / (wf_df["rolling_mean_y"].abs() + eps)
     global_error_rate = float(wf_df["abs_err"].mean() / (wf_df["y_true"].abs().mean() + eps))
+    global_error_rate = float(np.clip(global_error_rate, 0.0, 1.0))
     wf_df["error_rate"] = wf_df["error_rate_roll"].fillna(global_error_rate)
+    wf_df["error_rate"] = wf_df["error_rate"].clip(lower=0.0, upper=1.0)
 
     pred_low, pred_mid, pred_high = build_error_band(
         wf_df["y_pred_cal"].to_numpy(), wf_df["error_rate"].to_numpy()
     )
-    wf_df["y_pred_low"] = pred_low
-    wf_df["y_pred_mid"] = pred_mid
-    wf_df["y_pred_high"] = pred_high
+    wf_df["y_pred_low"] = np.round(pred_low).astype(int)
+    wf_df["y_pred_mid"] = np.round(pred_mid).astype(int)
+    wf_df["y_pred_high"] = np.round(pred_high).astype(int)
+    wf_df["y_pred"] = np.round(wf_df["y_pred"]).astype(int)
+    low_value, mid_value, high_value = compute_decile_values(
+        wf_df["y_pred_low"].to_numpy(),
+        wf_df["y_pred_high"].to_numpy(),
+    )
+    wf_df["low_value"] = low_value
+    wf_df["mid_value"] = mid_value
+    wf_df["high_value"] = high_value
 
     wf_df.to_csv(output_path, index=False)
     wf_metrics = evaluate_predictions(wf_df["y_true"], wf_df["y_pred_cal"], label="walk_forward")
@@ -670,6 +977,17 @@ def evaluate_predictions(y_true: pd.Series, preds: np.ndarray, label: str = "") 
     smape = float(
         np.mean(2 * np.abs(y_true - preds) / (np.abs(y_true) + np.abs(preds) + eps))
     )
+    # Weighted WAPE: heavier on top-demand weeks (>=75th percentile)
+    high_cut = np.quantile(np.abs(y_true), 0.75) if len(y_true) else 0
+    weights = np.where(np.abs(y_true) >= high_cut, 2.0, 1.0)
+    wwape = float(
+        np.sum(weights * np.abs(y_true - preds)) / (np.sum(weights * np.abs(y_true)) + eps)
+    )
+    under_mask = preds < y_true
+    under_rate = float(np.mean(under_mask)) if len(y_true) else 0.0
+    under_share = float(
+        np.sum((y_true - preds) * under_mask) / (np.sum(np.abs(y_true)) + eps)
+    )
     metrics = {
         "label": label,
         "rmse": rmse,
@@ -679,6 +997,9 @@ def evaluate_predictions(y_true: pd.Series, preds: np.ndarray, label: str = "") 
         "bias": bias,
         "wape": wape,
         "smape": smape,
+        "wwape": wwape,
+        "under_forecast_rate": under_rate,
+        "under_forecast_share": under_share,
     }
     return metrics
 
@@ -687,14 +1008,145 @@ def build_error_band(
     preds: np.ndarray, error_rate: float | np.ndarray | pd.Series
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (low, mid, high) predictions using a symmetric percentage band."""
-    rates = np.asarray(error_rate)
+    rates = np.asarray(error_rate, dtype=float)
     if np.any(rates < 0):
         raise ValueError("error_rate must be non-negative")
+    rates = np.clip(rates, 0.0, 1.0)
     mid = preds
     delta = np.abs(preds) * rates
     low = np.clip(mid - delta, 0, None)
     high = mid + delta
     return low, mid, high
+
+
+def compute_decile_values(
+    pred_low: np.ndarray | pd.Series, pred_high: np.ndarray | pd.Series
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split the rounded [low, high] range into deciles and return 3/4/3 min-max ranges."""
+    low_round = np.round(np.asarray(pred_low, dtype=float))
+    high_round = np.round(np.asarray(pred_high, dtype=float))
+    low_base = np.minimum(low_round, high_round)
+    high_base = np.maximum(low_round, high_round)
+    step = (high_base - low_base) / 10.0
+    low_min = np.round(low_base).astype(int)
+    low_max = np.round(low_base + 3 * step).astype(int)
+    mid_min = np.round(low_base + 3 * step).astype(int)
+    mid_max = np.round(low_base + 7 * step).astype(int)
+    high_min = np.round(low_base + 7 * step).astype(int)
+    high_max = np.round(high_base).astype(int)
+    low_range = np.array([f"{a}-{b}" for a, b in zip(low_min, low_max)], dtype=object)
+    mid_range = np.array([f"{a}-{b}" for a, b in zip(mid_min, mid_max)], dtype=object)
+    high_range = np.array([f"{a}-{b}" for a, b in zip(high_min, high_max)], dtype=object)
+    return low_range, mid_range, high_range
+
+
+def calibrate_per_drug_scale(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    drug_ids: np.ndarray,
+    clip_range: tuple[float, float] = (0.5, 1.5),
+) -> dict:
+    """Fit per-drug multiplicative scale on validation data."""
+    scales: dict = {}
+    for drug in np.unique(drug_ids):
+        mask = drug_ids == drug
+        denom = float(np.sum(y_pred[mask] ** 2))
+        if denom <= 0:
+            scales[drug] = 1.0
+            continue
+        a = float(np.sum(y_true[mask] * y_pred[mask]) / denom)
+        a = float(np.clip(a, clip_range[0], clip_range[1]))
+        scales[drug] = a
+    return scales
+
+
+def apply_per_drug_scale(
+    y_pred: np.ndarray,
+    drug_ids: np.ndarray,
+    scales: dict,
+) -> np.ndarray:
+    scaled = np.array(y_pred, copy=True)
+    for i, drug in enumerate(drug_ids):
+        scaled[i] = scaled[i] * scales.get(drug, 1.0)
+    return np.clip(scaled, 0, None)
+
+
+def compute_residual_quantiles(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    drug_ids: np.ndarray,
+    quantiles: tuple[float, float] = (0.8, 0.9),
+) -> dict:
+    """Compute per-drug residual quantiles for inventory-style bands."""
+    q_map: dict = {}
+    for drug in np.unique(drug_ids):
+        mask = drug_ids == drug
+        residuals = y_true[mask] - y_pred[mask]
+        if residuals.size == 0:
+            q_map[drug] = (0.0, 0.0)
+            continue
+        q_vals = np.quantile(residuals, quantiles)
+        q_map[drug] = tuple(float(v) for v in q_vals)
+    return q_map
+
+
+def apply_residual_quantiles(
+    y_pred: np.ndarray,
+    drug_ids: np.ndarray,
+    q_map: dict,
+) -> tuple[np.ndarray, np.ndarray]:
+    q80 = np.array(y_pred, copy=True)
+    q90 = np.array(y_pred, copy=True)
+    for i, drug in enumerate(drug_ids):
+        q_vals = q_map.get(drug, (0.0, 0.0))
+        q80[i] = y_pred[i] + q_vals[0]
+        q90[i] = y_pred[i] + q_vals[1]
+    return np.clip(q80, 0, None), np.clip(q90, 0, None)
+
+
+def apply_spike_policy(
+    y_pred: np.ndarray,
+    meta: pd.DataFrame,
+    y_true: np.ndarray | None = None,
+    k_values: Iterable[float] = (1.0, 1.1, 1.2),
+    min_z: float = 2.0,
+) -> np.ndarray:
+    """Post-process predictions for spike weeks using per-drug thresholds."""
+    if "spike_score_8" not in meta.columns or "UPW_rollmax_8" not in meta.columns:
+        return y_pred
+
+    drug_ids = meta["DrugId"].to_numpy()
+    spike_score = meta["spike_score_8"].to_numpy()
+    rollmax_8 = meta["UPW_rollmax_8"].to_numpy()
+
+    # Per-drug threshold from train/valid distribution
+    z_thr = {}
+    for drug in np.unique(drug_ids):
+        vals = spike_score[drug_ids == drug]
+        if len(vals) == 0:
+            z_thr[drug] = min_z
+        else:
+            z_thr[drug] = max(min_z, float(np.quantile(vals, 0.9)))
+
+    # Global k selection on spikes
+    best_k = list(k_values)[0]
+    if y_true is not None:
+        best_wape = float("inf")
+        for k in k_values:
+            adjusted = np.array(y_pred, copy=True)
+            for i, drug in enumerate(drug_ids):
+                if spike_score[i] > z_thr.get(drug, min_z):
+                    adjusted[i] = max(adjusted[i], rollmax_8[i] * k)
+            wape = float(np.sum(np.abs(y_true - adjusted)) / (np.sum(np.abs(y_true)) + 1e-6))
+            if wape < best_wape:
+                best_wape = wape
+                best_k = k
+
+    adjusted = np.array(y_pred, copy=True)
+    for i, drug in enumerate(drug_ids):
+        if spike_score[i] > z_thr.get(drug, min_z):
+            adjusted[i] = max(adjusted[i], rollmax_8[i] * best_k)
+    return np.clip(adjusted, 0, None)
 
 
 def shuffle_target_test(
@@ -706,7 +1158,8 @@ def shuffle_target_test(
     random_seed: int | None = None,
 ) -> dict[str, float]:
     """Leakage check: shuffle targets and retrain; metrics should be near-zero signal."""
-    order = np.argsort(X["week_start_ts"].values)
+    meta = _ensure_week_start_ts(meta)
+    order = np.argsort(meta["week_start_ts"].values)
     X_ordered = X.iloc[order].reset_index(drop=True)
     y_ordered = y.iloc[order].reset_index(drop=True)
 
@@ -757,8 +1210,10 @@ def print_evaluation(
     def _fmt(m: dict[str, float]) -> str:
         return (
             f"RMSE={m['rmse']:.3f} | MAE={m['mae']:.3f} | MedAE={m['median_ae']:.3f} | "
-            f"R2={m['r2']:.3f} | WAPE={m['wape']:.3f} | sMAPE={m['smape']:.3f} | "
-            f"Bias={m['bias']:.3f}"
+            f"R2={m['r2']:.3f} | WAPE={m['wape']:.3f} | WWAPE={m.get('wwape', 0):.3f} | "
+            f"sMAPE={m['smape']:.3f} | Bias={m['bias']:.3f} | "
+            f"UnderRate={m.get('under_forecast_rate', 0):.2f} | "
+            f"UnderShare={m.get('under_forecast_share', 0):.3f}"
         )
 
     print("\n=== Evaluation ===")
@@ -801,16 +1256,24 @@ def main(
     weekly_features_path = processed_dir / "weekly_features.csv"
 
     X, y, meta = prepare_features(df)
+    diagnostics_dir = active_run_dir / "diagnostics"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    audit_df = pd.concat([meta, X, y.rename("UPW")], axis=1)
+    audit_report = audit_feature_leakage(
+        audit_df, output_path=diagnostics_dir / "feature_leakage_audit.csv"
+    )
+    if not audit_report.empty and audit_report["mismatch_count"].sum() > 0:
+        print("\n[WARN] Leakage audit found mismatches; see diagnostics/feature_leakage_audit.csv")
     model_params = {
         "objective": "reg:squarederror",
         "eval_metric": ["rmse", "mae"],
         "eta": 0.05,
-        "max_depth": 4,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "min_child_weight": 6.0,
+        "max_depth": 5,
+        "subsample": 0.75,
+        "colsample_bytree": 0.75,
+        "min_child_weight": 8.0,
         "gamma": 0.4,
-        "reg_lambda": 1.0,
+        "reg_lambda": 1.5,
         "reg_alpha": 0.1,
         "seed": int(active_settings.random_seed),
     }
@@ -838,15 +1301,32 @@ def main(
         _encoders,
     ) = splits
 
+    print(
+        "\n=== Split summary ===\n"
+        f"Train weeks: {_iso_range(meta_train['week_start'])} | Drugs={meta_train['DrugId'].nunique()}\n"
+        f"Valid weeks: {_iso_range(meta_valid['week_start'])} | Drugs={meta_valid['DrugId'].nunique()}\n"
+        f"Test weeks:  {_iso_range(meta_test['week_start'])} | Drugs={meta_test['DrugId'].nunique()}"
+    )
+
     train_metrics = evaluate_predictions(y_train, preds_train, label="train")
     valid_metrics = evaluate_predictions(y_valid, preds_valid, label="valid")
     test_metrics = evaluate_predictions(y_test, preds_test, label="test")
-    preds_valid_cal = apply_regime_calibration(
-        preds_valid, meta_valid, y_train, preds_train, meta_train, regime_col="regime_flag"
+    scales = calibrate_per_drug_scale(
+        y_valid.to_numpy(),
+        preds_valid,
+        meta_valid["DrugId"].to_numpy(),
     )
-    preds_test_cal = apply_regime_calibration(
-        preds_test, meta_test, y_train, preds_train, meta_train, regime_col="regime_flag"
+    preds_valid_cal = apply_per_drug_scale(
+        preds_valid, meta_valid["DrugId"].to_numpy(), scales
     )
+    preds_test_cal = apply_per_drug_scale(
+        preds_test, meta_test["DrugId"].to_numpy(), scales
+    )
+    if ENABLE_SPIKE_POLICY:
+        preds_valid_cal = apply_spike_policy(
+            preds_valid_cal, meta_valid, y_true=y_valid.to_numpy()
+        )
+        preds_test_cal = apply_spike_policy(preds_test_cal, meta_test, y_true=None)
     abs_err = np.abs(preds_valid_cal - y_valid.to_numpy())
     error_df = pd.DataFrame(
         {
@@ -861,27 +1341,32 @@ def main(
     )
     eps = 1e-6
     per_drug["error_rate"] = per_drug["mae"] / (per_drug["mean_y"].abs() + eps)
+    per_drug["error_rate"] = per_drug["error_rate"].clip(lower=0.0, upper=1.0)
     global_error_rate = float(abs_err.mean() / (np.abs(y_valid).mean() + eps))
+    global_error_rate = float(np.clip(global_error_rate, 0.0, 1.0))
     error_rate_series = meta_valid["DrugId"].map(
         per_drug.set_index("DrugId")["error_rate"]
     ).fillna(global_error_rate)
+    error_rate_series = error_rate_series.clip(lower=0.0, upper=1.0)
     pred_low, pred_mid, pred_high = build_error_band(preds_valid_cal, error_rate_series.to_numpy())
     valid_cal_metrics = evaluate_predictions(y_valid, preds_valid_cal, label="valid_calibrated")
     test_cal_metrics = evaluate_predictions(y_test, preds_test_cal, label="test_calibrated")
     print_evaluation(train_metrics, valid_metrics, test_metrics)
-    print("Calibrated (bias-corrected) valid metrics:")
+    print("Valid metrics (per-drug scale):")
     print(
         f"RMSE={valid_cal_metrics['rmse']:.3f} | MAE={valid_cal_metrics['mae']:.3f} | "
         f"MedAE={valid_cal_metrics['median_ae']:.3f} | R2={valid_cal_metrics['r2']:.3f} | "
-        f"WAPE={valid_cal_metrics['wape']:.3f} | sMAPE={valid_cal_metrics['smape']:.3f} | "
-        f"Bias={valid_cal_metrics['bias']:.3f}"
+        f"WAPE={valid_cal_metrics['wape']:.3f} | WWAPE={valid_cal_metrics['wwape']:.3f} | "
+        f"sMAPE={valid_cal_metrics['smape']:.3f} | Bias={valid_cal_metrics['bias']:.3f} | "
+        f"UnderRate={valid_cal_metrics['under_forecast_rate']:.2f}"
     )
-    print("Calibrated (bias-corrected) test metrics:")
+    print("Test metrics (per-drug scale):")
     print(
         f"RMSE={test_cal_metrics['rmse']:.3f} | MAE={test_cal_metrics['mae']:.3f} | "
         f"MedAE={test_cal_metrics['median_ae']:.3f} | R2={test_cal_metrics['r2']:.3f} | "
-        f"WAPE={test_cal_metrics['wape']:.3f} | sMAPE={test_cal_metrics['smape']:.3f} | "
-        f"Bias={test_cal_metrics['bias']:.3f}"
+        f"WAPE={test_cal_metrics['wape']:.3f} | WWAPE={test_cal_metrics['wwape']:.3f} | "
+        f"sMAPE={test_cal_metrics['smape']:.3f} | Bias={test_cal_metrics['bias']:.3f} | "
+        f"UnderRate={test_cal_metrics['under_forecast_rate']:.2f}"
     )
 
     # Time-series cross-validation summary
@@ -890,6 +1375,7 @@ def main(
         X,
         y,
         params=model_params,
+        meta=meta,
         n_splits=3,
         num_boost_round=300,
         early_stopping_rounds=40,
@@ -918,6 +1404,9 @@ def main(
             error_window=8,
             output_path=str(run_wf_path),
         )
+        fold1_path = diagnostics_dir / "walkforward_fold1_drugs.csv"
+        summarize_walkforward_fold1(wf_df, meta, output_path=fold1_path)
+        _copy_if_exists(fold1_path, processed_dir / fold1_path.name)
         _copy_if_exists(run_wf_path, processed_dir / run_wf_path.name)
         print(
             f"Walk-forward: RMSE={wf_metrics['rmse']:.3f} | MAE={wf_metrics['mae']:.3f} | "
@@ -933,12 +1422,35 @@ def main(
     valid_preview["y_true"] = y_valid.values
     valid_preview["y_pred"] = preds_valid
     valid_preview["y_pred_cal"] = preds_valid_cal
+    q_map = compute_residual_quantiles(
+        y_valid.to_numpy(),
+        preds_valid_cal,
+        meta_valid["DrugId"].to_numpy(),
+    )
+    q80, q90 = apply_residual_quantiles(
+        preds_valid_cal,
+        meta_valid["DrugId"].to_numpy(),
+        q_map,
+    )
+    valid_preview["y_pred_q80"] = q80
+    valid_preview["y_pred_q90"] = q90
     valid_preview["y_pred_low"] = pred_low
     valid_preview["y_pred_mid"] = pred_mid
     valid_preview["y_pred_high"] = pred_high
     valid_preview["error_rate"] = error_rate_series.to_numpy()
-    valid_preview["y_pred_round"] = np.round(preds_valid).astype(int)
-    valid_preview["y_pred_cal_round"] = np.round(preds_valid_cal).astype(int)
+    valid_preview["y_pred"] = np.round(valid_preview["y_pred"]).astype(int)
+    valid_preview["y_pred_low"] = np.round(valid_preview["y_pred_low"]).astype(int)
+    valid_preview["y_pred_mid"] = np.round(valid_preview["y_pred_mid"]).astype(int)
+    valid_preview["y_pred_high"] = np.round(valid_preview["y_pred_high"]).astype(int)
+    valid_preview["y_pred_round"] = valid_preview["y_pred"]
+    valid_preview["y_pred_cal_round"] = np.round(valid_preview["y_pred_cal"]).astype(int)
+    low_value, mid_value, high_value = compute_decile_values(
+        valid_preview["y_pred_low"].to_numpy(),
+        valid_preview["y_pred_high"].to_numpy(),
+    )
+    valid_preview["low_value"] = low_value
+    valid_preview["mid_value"] = mid_value
+    valid_preview["high_value"] = high_value
     valid_preview["residual"] = valid_preview["y_true"] - valid_preview["y_pred"]
     valid_preview["residual_cal"] = valid_preview["y_true"] - valid_preview["y_pred_cal"]
     run_valid_path = pred_dir / "upw_valid_predictions.csv"
@@ -1010,9 +1522,15 @@ def main(
     data_manifest = _build_data_manifest(df, meta_train, meta_valid, meta_test, weekly_features_path)
     train_params = {
         "xgb_params": model_params,
-        "split_weeks": {"train": 0.7, "valid": 0.15, "test": 0.15},
-        "num_boost_round": 300,
-        "early_stopping_rounds": 40,
+        "split_weeks": {"train": "years_1_2", "valid": "year3_h1", "test": "year3_h2"},
+        "num_boost_round": 250,
+        "early_stopping_rounds": 35,
+        "two_stage": {"enabled": False},
+        "weights": {
+            "time_decay_half_life_weeks": 26,
+            "volume_weight": "sqrt(train_total/median)",
+            "censored_weight": 0.5,
+        },
         "baseline_windows": {"moving_avg": 4, "seasonal_naive": 52},
         "walk_forward": {
             "enabled": bool(active_run_walk_forward),

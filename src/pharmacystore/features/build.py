@@ -280,13 +280,12 @@ def add_weekly_rolling_features(weekly_df: pd.DataFrame, epsilon: float = 1e-6) 
         g["UPW_lag6"] = g["UPW"].shift(6)
         lag_series = g["UPW_lag1"]
 
-        g["UPW_rollmean_2"] = lag_series.rolling(window=2, min_periods=2).mean()
         g["UPW_rollmean_4"] = lag_series.rolling(window=4, min_periods=4).mean()
-        g["UPW_rollmean_6"] = lag_series.rolling(window=6, min_periods=6).mean()
-        g["UPW_rollstd_3"] = lag_series.rolling(window=3, min_periods=3).std()
-        g["UPW_rollstd_6"] = lag_series.rolling(window=6, min_periods=6).std()
-        g["UPW_rollmin"] = lag_series.rolling(window=3, min_periods=3).min()
-        g["UPW_rollmax"] = lag_series.rolling(window=3, min_periods=3).max()
+        g["UPW_rollmean_8"] = lag_series.rolling(window=8, min_periods=8).mean()
+        g["UPW_rollmean_12"] = lag_series.rolling(window=12, min_periods=12).mean()
+        g["UPW_rollmean_52"] = lag_series.rolling(window=52, min_periods=26).mean()
+        g["UPW_rollstd_8"] = lag_series.rolling(window=8, min_periods=8).std()
+        g["UPW_rollmax_8"] = lag_series.rolling(window=8, min_periods=8).max()
 
         g["diff_rate"] = lag_series.pct_change()
         g["avg_point"] = (lag_series + lag_series.shift(1)) / 2
@@ -294,23 +293,29 @@ def add_weekly_rolling_features(weekly_df: pd.DataFrame, epsilon: float = 1e-6) 
         roll_std_12 = lag_series.rolling(window=12, min_periods=12).std()
         g["Z_score"] = (lag_series - roll_mean_12) / (roll_std_12 + epsilon)
 
+        g["weeks_since_peak_13"] = (
+            lag_series
+            .rolling(window=13, min_periods=4)
+            .apply(lambda s: len(s) - 1 - int(np.argmax(s.values)))
+        )
+
+        # Winsorize highly-volatile features to reduce regime-shift explosions
+        g["diff_rate"] = g["diff_rate"].clip(lower=-3, upper=3)
+        g["Z_score"] = g["Z_score"].clip(lower=-3, upper=3)
+
         # Guard against inf from zero divisors and drop rows without full history
         g = g.replace([np.inf, -np.inf], np.nan)
         history_cols = [
             "UPW_lag1",
             "UPW_lag2",
-            "UPW_lag3",
             "UPW_lag4",
-            "UPW_lag6",
-            "UPW_rollmean_2",
             "UPW_rollmean_4",
-            "UPW_rollmean_6",
-            "UPW_rollstd_3",
-            "UPW_rollstd_6",
-            "UPW_rollmin",
-            "UPW_rollmax",
+            "UPW_rollmean_8",
+            "UPW_rollmean_12",
+            "UPW_rollmax_8",
+            "UPW_rollstd_8",
+            "weeks_since_peak_13",
             "diff_rate",
-            "avg_point",
             "Z_score",
         ]
         g = g.dropna(subset=history_cols)

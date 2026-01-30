@@ -12,7 +12,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS_PATH = PROJECT_ROOT / "requirements.txt"
 ATC_REFERENCE = PROJECT_ROOT / "data" / "external" / "who_atc_ddd.csv"
 RESTORE_SCRIPT = PROJECT_ROOT / "scripts" / "restore_db.sh"
-RESTORE_PS_SCRIPT = PROJECT_ROOT / "restore_mssql_docker.ps1"
 
 
 def _prompt_yes_no(label: str, default: bool) -> bool:
@@ -38,26 +37,12 @@ def _prompt_secret(label: str) -> str:
 
 def _run_restore(env: dict[str, str]) -> None:
     system = platform.system().lower()
-    if system.startswith("windows"):
-        subprocess.run(
-            [
-                "powershell",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(RESTORE_PS_SCRIPT),
-                "-DB_NAME",
-                "PharmacyStore",
-            ],
-            cwd=PROJECT_ROOT,
-            env=env,
-            check=True,
+    if system != "linux":
+        raise RuntimeError(
+            f"Unsupported OS for restore: {platform.system()}. "
+            "Use WSL/Linux and run restore_db.sh."
         )
-        return
-    if system == "linux":
-        subprocess.run(["bash", str(RESTORE_SCRIPT)], cwd=PROJECT_ROOT, env=env, check=True)
-        return
-    raise RuntimeError(f"Unsupported operating system: {platform.system()}")
+    subprocess.run(["bash", str(RESTORE_SCRIPT)], cwd=PROJECT_ROOT, env=env, check=True)
 
 
 def _install_dependencies() -> None:
