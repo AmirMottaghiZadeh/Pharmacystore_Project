@@ -8,11 +8,14 @@ Outputs:
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 JALALI_MONTH_DAYS = [31, 31, 31, 31, 31, 31, 30, 30, 30, 30, 30, 29]
@@ -126,8 +129,8 @@ def build_datasets() -> None:
     weekly_counts = compute_weekly_official_counts(official_dates)
     weekly_counts.to_csv(weekly_csv, index=False)
 
-    print(f"Saved holiday rows with Gregorian dates to: {gregorian_csv}")
-    print(f"Saved weekly official holiday counts ({len(weekly_counts)} rows) to: {weekly_csv}")
+    logger.info("Saved holiday rows with Gregorian dates to: %s", gregorian_csv)
+    logger.info("Saved weekly official holiday counts (%d rows) to: %s", len(weekly_counts), weekly_csv)
 
 
 if __name__ == "__main__":

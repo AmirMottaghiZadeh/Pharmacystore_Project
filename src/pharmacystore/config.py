@@ -27,6 +27,23 @@ class Settings(BaseSettings):
 
     random_seed: int = Field(default=42)
     run_walk_forward: bool = Field(default=True)
+    
+    # Model hyperparameters
+    xgb_eta: float = Field(default=0.05)
+    xgb_max_depth: int = Field(default=5)
+    xgb_subsample: float = Field(default=0.75)
+    xgb_colsample_bytree: float = Field(default=0.75)
+    xgb_min_child_weight: float = Field(default=8.0)
+    xgb_gamma: float = Field(default=0.4)
+    xgb_reg_lambda: float = Field(default=1.5)
+    xgb_reg_alpha: float = Field(default=0.1)
+    xgb_num_boost_round: int = Field(default=250)
+    xgb_early_stopping_rounds: int = Field(default=35)
+    
+    # Training configuration
+    train_frac: float = Field(default=0.7)
+    valid_frac: float = Field(default=0.15)
+    cv_n_splits: int = Field(default=3)
 
     def data_path(self) -> Path:
         return Path(self.data_dir)

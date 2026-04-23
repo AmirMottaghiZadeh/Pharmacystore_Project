@@ -1,9 +1,12 @@
-from typing import Optional
+from __future__ import annotations
+
+import logging
 
 import pandas as pd
 import pyodbc
-
 from pharmacystore.config import Settings, get_settings
+
+logger = logging.getLogger(__name__)
 
 
 def _build_conn_str(settings: Settings) -> str:
@@ -32,13 +35,13 @@ def _build_conn_str(settings: Settings) -> str:
     )
 
 
-def get_connection(settings: Optional[Settings] = None) -> pyodbc.Connection:
+def get_connection(settings: Settings | None = None) -> pyodbc.Connection:
     """Open a new database connection."""
     active_settings = settings or get_settings()
     return pyodbc.connect(_build_conn_str(active_settings))
 
 
-def _run_query(query: str, conn: Optional[pyodbc.Connection] = None) -> pd.DataFrame:
+def _run_query(query: str, conn: pyodbc.Connection | None = None) -> pd.DataFrame:
     """Execute a SQL query and return a DataFrame, closing the connection if we opened it."""
     should_close = conn is None
     active_conn = conn or get_connection()
@@ -48,7 +51,11 @@ def _run_query(query: str, conn: Optional[pyodbc.Connection] = None) -> pd.DataF
     return df
 
 
-def fetch_drugs(conn: Optional[pyodbc.Connection] = None) -> pd.DataFrame:
+def fetch_drugs(conn: pyodbc.Connection | None = None) -> pd.DataFrame:
+    """Fetch drug master data.
+    
+    Note: This query has no user input, so SQL injection is not a risk.
+    """
     query = """
     SELECT ID, GenericName, BrandName, AtcCode , IsDrugs , Hospital , IsSumDrug , IsOTCDRUG , IsTarkibi , SubGroupID
     FROM dr_Drugs
@@ -56,7 +63,11 @@ def fetch_drugs(conn: Optional[pyodbc.Connection] = None) -> pd.DataFrame:
     return _run_query(query, conn)
 
 
-def fetch_prescription_detail(conn: Optional[pyodbc.Connection] = None) -> pd.DataFrame:
+def fetch_prescription_detail(conn: pyodbc.Connection | None = None) -> pd.DataFrame:
+    """Fetch prescription detail log.
+    
+    Note: This query has no user input, so SQL injection is not a risk.
+    """
     query = """
     SELECT PrID, DrugId, PacketQuantity, LogDateTime, SalePrice
     FROM dr_PrescriptionDetailLog
@@ -64,7 +75,11 @@ def fetch_prescription_detail(conn: Optional[pyodbc.Connection] = None) -> pd.Da
     return _run_query(query, conn)
 
 
-def fetch_factor_detail(conn: Optional[pyodbc.Connection] = None) -> pd.DataFrame:
+def fetch_factor_detail(conn: pyodbc.Connection | None = None) -> pd.DataFrame:
+    """Fetch factor detail data.
+    
+    Note: This query has no user input, so SQL injection is not a risk.
+    """
     query = """
     SELECT DrugID, PacketQuantity, Qnt, SalePrice AS FactorSalePrice, KharidPrice
     FROM dr_FactorDetail

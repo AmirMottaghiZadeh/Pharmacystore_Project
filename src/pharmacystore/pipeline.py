@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import logging
 from pathlib import Path
 
 import pandas as pd
@@ -21,6 +23,9 @@ from pharmacystore.features.build import (
     merge_drug_prescription_factor,
 )
 from pharmacystore.run_utils import set_global_seed
+from pharmacystore.logging_config import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def collapse_to_generic(weekly_df: pd.DataFrame) -> pd.DataFrame:
@@ -57,12 +62,19 @@ def collapse_to_generic(weekly_df: pd.DataFrame) -> pd.DataFrame:
 def run_pipeline(settings: Settings | None = None) -> pd.DataFrame:
     """Pull data from SQL, build merged DataFrames, and display quick previews."""
     active_settings = settings or get_settings()
+    if not all([active_settings.sql_server, active_settings.sql_database, active_settings.sql_username, active_settings.sql_password]):
+        raise ValueError("Database connection settings are incomplete. Check your .env file.")
     set_global_seed(active_settings.random_seed)
 
     with get_connection(active_settings) as conn:
         drugs_df = fetch_drugs(conn)
         presc_df = fetch_prescription_detail(conn)
         factor_df = fetch_factor_detail(conn)
+
+    if drugs_df.empty or presc_df.empty:
+        raise ValueError("Failed to fetch data from database. Check database connection and table contents.")
+    
+    logger.info("Fetched %d drugs, %d prescriptions, %d factors", len(drugs_df), len(presc_df), len(factor_df))
 
     merged_by_drug = merge_drug_prescription_factor(
         drugs_df, presc_df, factor_df, sort_key="DrugID", use_factor_agg=False
@@ -80,6 +92,9 @@ def run_pipeline(settings: Settings | None = None) -> pd.DataFrame:
     sales_price_df, selected_drugs_df, selected_drugs, _ = calculate_sales_and_price_categories(
         presc_df, stats=sales_stats
     )
+    
+    if selected_drugs_df.empty:
+        raise ValueError("No drugs selected after sales categorization. Check sales thresholds.")
     atc_classified_df = classify_atc_codes(drugs_df)
 
     weekly_features_df = build_weekly_unique_packets(presc_df, selected_drugs_df["DrugId"])
@@ -143,32 +158,37 @@ def run_pipeline(settings: Settings | None = None) -> pd.DataFrame:
     final_weekly_df = weekly_features_df.copy()
 
     weekly_features_path = Path(active_settings.data_dir) / "processed" / "weekly_features.csv"
+    if final_weekly_df.empty:
+        raise ValueError("Final weekly features DataFrame is empty. Check pipeline logic.")
+    
     weekly_features_path.parent.mkdir(parents=True, exist_ok=True)
     final_weekly_df.to_csv(weekly_features_path, index=False)
 
-    print("\n=== Merged (sorted by DrugID) sample ===")
-    print(merged_by_drug.head())
+    logger.info("=== Merged (sorted by DrugID) sample ===")
+    logger.info("\n%s", merged_by_drug.head())
 
-    print("\n=== Merged (sorted by PrID) sample ===")
-    print(merged_by_prescription.head())
+    logger.info("=== Merged (sorted by PrID) sample ===")
+    logger.info("\n%s", merged_by_prescription.head())
 
-    print("\n=== Sales scaling sample ===")
-    print(sales_price_df.head())
-    print("\nSelected drugs (top-selling labels):")
-    print(selected_drugs_df.head())
+    logger.info("=== Sales scaling sample ===")
+    logger.info("\n%s", sales_price_df.head())
+    logger.info("Selected drugs (top-selling labels):")
+    logger.info("\n%s", selected_drugs_df.head())
 
-    print("\n=== ATC classification sample ===")
-    print(atc_classified_df[["ID", "GenericName", "AtcCode", "classified_code", "atc_name"]].head())
+    logger.info("=== ATC classification sample ===")
+    logger.info("\n%s", atc_classified_df[["ID", "GenericName", "AtcCode", "classified_code", "atc_name"]].head())
 
-    print("\n=== Weekly features sample ===")
-    print(final_weekly_df.head(10))
-    print(f"\nTotal weekly rows: {len(final_weekly_df)}")
-    print(f"Selected drugs (dict): {selected_drugs[:5]}")
-    print(f"\nSaved weekly features to {weekly_features_path}")
+    logger.info("=== Weekly features sample ===")
+    logger.info("\n%s", final_weekly_df.head(10))
+    logger.info("Total weekly rows: %d", len(final_weekly_df))
+    logger.info("Selected drugs (dict): %s", selected_drugs[:5])
+    logger.info("Saved weekly features to %s", weekly_features_path)
     return final_weekly_df
 
 
 def main() -> None:
+    setup_logging()
+    logger.info("Starting PharmacyStore pipeline")
     parser = argparse.ArgumentParser(description="PharmacyStore pipeline runner")
     parser.add_argument(
         "--run-tag",
@@ -184,27 +204,35 @@ def main() -> None:
     args = parser.parse_args()
     settings = get_settings()
 
-    if args.command == "run":
-        run_pipeline(settings=settings)
-        return
+    try:
+        if args.command == "run":
+            run_pipeline(settings=settings)
+            logger.info("Pipeline completed successfully")
+            return
 
-    if args.command == "train":
-        from pharmacystore.models.train_xgb import main as train_main
+        if args.command == "train":
+            from pharmacystore.models.train_xgb import main as train_main
 
-        train_main(settings=settings, run_tag=args.run_tag)
-        return
+            train_main(settings=settings, run_tag=args.run_tag)
+            logger.info("Training completed successfully")
+            return
 
-    if args.command == "train-baseline":
-        from pharmacystore.models.train_xgb_baseline import main as train_baseline_main
+        if args.command == "train-baseline":
+            from pharmacystore.models.train_xgb_baseline import main as train_baseline_main
 
-        train_baseline_main(settings=settings, run_tag=args.run_tag)
-        return
+            train_baseline_main(settings=settings, run_tag=args.run_tag)
+            logger.info("Baseline training completed successfully")
+            return
 
-    if args.command == "full":
-        from pharmacystore.models.train_xgb import main as train_main
+        if args.command == "full":
+            from pharmacystore.models.train_xgb import main as train_main
 
-        df = run_pipeline(settings=settings)
-        train_main(settings=settings, data=df, run_tag=args.run_tag)
+            df = run_pipeline(settings=settings)
+            train_main(settings=settings, data=df, run_tag=args.run_tag)
+            logger.info("Full pipeline completed successfully")
+    except Exception as e:
+        logger.error("Pipeline failed: %s", str(e), exc_info=True)
+        raise
 
 
 if __name__ == "__main__":

@@ -9,13 +9,13 @@ description = "Pharmacy sales forecasting with XGBoost"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "numpy",
-  "pandas",
-  "pydantic",
-  "pydantic-settings",
-  "pyodbc",
-  "scikit-learn",
-  "xgboost",
+  "numpy==1.26.4",
+  "pandas==2.2.1",
+  "pydantic==2.6.4",
+  "pydantic-settings==2.2.1",
+  "pyodbc==5.1.0",
+  "scikit-learn==1.4.1.post1",
+  "xgboost==2.0.3",
 ]
 
 [tool.setuptools]
