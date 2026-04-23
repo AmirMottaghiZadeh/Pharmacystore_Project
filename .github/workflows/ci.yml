@@ -10,6 +10,7 @@ jobs:
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,15 +21,6 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Cache pytest data
-        uses: actions/cache@v4
-        with:
-          path: |
-            .pytest_cache
-          key: ${{ runner.os }}-pytest-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pytest-
-
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y unixodbc-dev
 
@@ -37,23 +29,12 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m pip install -e .
+          python -m pip install pytest pytest-cov
 
       - name: Compile check
         run: python -m compileall src
 
-      - name: Install pytest
-        run: |
-          python -m pip install pytest
-
-      - name: Run Tests
-        run: |
-          pytest --maxfail=1 --disable-warnings -q
-
-      - name: Install pytest-cov
-        run: |
-          python -m pip install pytest-cov
-
-      - name: Run Tests with Coverage
+      - name: Run tests with coverage
         run: |
           pytest --cov=src --maxfail=1 --disable-warnings -q --junitxml=test-results.xml
 
@@ -65,8 +46,7 @@ jobs:
 
       - name: Build Docker Image
         if: ${{ vars.DOCKER_IMAGE != '' }}
-        run: |
-          docker build -t ${{ vars.DOCKER_IMAGE }} .
+        run: docker build -t ${{ vars.DOCKER_IMAGE }} .
 
       - name: Log in to Docker Hub
         if: ${{ vars.DOCKER_IMAGE != '' && env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
@@ -77,5 +57,4 @@ jobs:
 
       - name: Push Docker Image
         if: ${{ vars.DOCKER_IMAGE != '' && env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
-        run: |
-          docker push ${{ vars.DOCKER_IMAGE }}
+        run: docker push ${{ vars.DOCKER_IMAGE }}
