@@ -18,7 +18,9 @@ def test_compute_sample_weights_basic():
     
     assert len(weights) == len(meta)
     assert np.all(weights > 0)
-    assert weights[-1] > weights[0]  # Recent weeks should have higher weight
+    # Recency should increase weights within each drug series.
+    assert weights[3] > weights[0]
+    assert weights[7] > weights[4]
 
 
 def test_compute_sample_weights_empty():
