@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 
 import pandas as pd
-import pyodbc
 from pharmacystore.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -35,13 +34,17 @@ def _build_conn_str(settings: Settings) -> str:
     )
 
 
-def get_connection(settings: Settings | None = None) -> pyodbc.Connection:
+def get_connection(settings: Settings | None = None):
     """Open a new database connection."""
+    try:
+        import pyodbc
+    except ImportError:
+        raise ImportError("pyodbc is required for database connections. Install with: pip install pharmacystore[db]")
     active_settings = settings or get_settings()
     return pyodbc.connect(_build_conn_str(active_settings))
 
 
-def _run_query(query: str, conn: pyodbc.Connection | None = None) -> pd.DataFrame:
+def _run_query(query: str, conn = None) -> pd.DataFrame:
     """Execute a SQL query and return a DataFrame, closing the connection if we opened it."""
     should_close = conn is None
     active_conn = conn or get_connection()
@@ -51,7 +54,7 @@ def _run_query(query: str, conn: pyodbc.Connection | None = None) -> pd.DataFram
     return df
 
 
-def fetch_drugs(conn: pyodbc.Connection | None = None) -> pd.DataFrame:
+def fetch_drugs(conn = None) -> pd.DataFrame:
     """Fetch drug master data.
     
     Note: This query has no user input, so SQL injection is not a risk.
@@ -63,7 +66,7 @@ def fetch_drugs(conn: pyodbc.Connection | None = None) -> pd.DataFrame:
     return _run_query(query, conn)
 
 
-def fetch_prescription_detail(conn: pyodbc.Connection | None = None) -> pd.DataFrame:
+def fetch_prescription_detail(conn = None) -> pd.DataFrame:
     """Fetch prescription detail log.
     
     Note: This query has no user input, so SQL injection is not a risk.
@@ -75,7 +78,7 @@ def fetch_prescription_detail(conn: pyodbc.Connection | None = None) -> pd.DataF
     return _run_query(query, conn)
 
 
-def fetch_factor_detail(conn: pyodbc.Connection | None = None) -> pd.DataFrame:
+def fetch_factor_detail(conn = None) -> pd.DataFrame:
     """Fetch factor detail data.
     
     Note: This query has no user input, so SQL injection is not a risk.
