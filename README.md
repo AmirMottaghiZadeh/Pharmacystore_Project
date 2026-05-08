@@ -14,14 +14,15 @@
 5. [Execution flow](#execution-flow-run_allpy)
 6. [Architecture overview](#architecture-overview)
 7. [Manual commands](#manual-commands)
-8. [Configuration](#configuration-env)
-9. [Feature engineering](#feature-engineering)
-10. [Forecast target & evaluation](#forecast-target--evaluation)
-11. [Outputs](#outputs)
-12. [Reproducibility](#reproducibility)
-13. [Operational maturity checklist](#operational-maturity-checklist)
-14. [Troubleshooting](#troubleshooting)
-15. [Credits & maintenance](#credits--maintenance)
+8. [Dashboard (Streamlit)](#dashboard-streamlit)
+9. [Configuration](#configuration-env)
+10. [Feature engineering](#feature-engineering)
+11. [Forecast target & evaluation](#forecast-target--evaluation)
+12. [Outputs](#outputs)
+13. [Reproducibility](#reproducibility)
+14. [Operational maturity checklist](#operational-maturity-checklist)
+15. [Troubleshooting](#troubleshooting)
+16. [Credits & maintenance](#credits--maintenance)
 
 ## Why it matters
 - Automates extraction from SQL Server backups and builds a repeatable training dataset.
@@ -94,6 +95,25 @@ Legacy scripts (still supported):
 - `python scripts/train_baseline.py`
 - `python scripts/scale_sales.py`
 - `python scripts/classify_atc.py`
+
+## Dashboard (Streamlit)
+The repository includes an interactive dashboard at `scripts/dashboard.py` that reads:
+- `data/processed/weekly_features.csv`
+- `data/processed/upw_valid_predictions.csv`
+- `data/processed/upw_walkforward_predictions.csv`
+- `data/processed/upw_fold_drift.csv`
+- `artifacts/runs/<run_id>/metrics.json` (+ run manifests/configs)
+
+Install dashboard dependency and run:
+- `python -m pip install streamlit`
+- `streamlit run scripts/dashboard.py`
+
+Implemented views:
+- **Overview**: KPI cards (MAE/RMSE/WAPE/sMAPE), weekly error trend, and run leaderboard.
+- **Forecast Explorer**: filters by `DrugId`, `genericname`, `saleCategory`, `priceCategory`, `classified_drug`, and value segment (`low_value`, `mid_value`, `high_value`), plus `y_true` vs prediction bands.
+- **Risk & Alert**: Top-N risky drugs and shortage alerts based on under-forecast rate and spike score.
+- **Drift Monitor**: feature drift table with threshold on `|mean_pct|`.
+- **Run Comparison**: side-by-side metrics, split settings, and feature hash checks.
 
 ## Configuration (.env)
 Set via environment or `.env` (see `.env.example`):
