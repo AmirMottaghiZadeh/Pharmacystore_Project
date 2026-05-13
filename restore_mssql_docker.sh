@@ -8,7 +8,7 @@ SCRIPT_PATH="$(readlink -f "$0")"
 [[ -x "$SCRIPT_PATH" ]] || chmod +x "$SCRIPT_PATH"
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   echo "🔐 Re-running with sudo..."
-  exec sudo --preserve-env=SQL_PASS bash "$SCRIPT_PATH" "$@"
+  exec sudo --preserve-env=SQL_PASS,MSSQL_IMAGE,MSSQL_IMAGE_TAR bash "$SCRIPT_PATH" "$@"
 fi
 
 info(){ echo "✅ $*"; }
@@ -31,6 +31,46 @@ remove_env_var(){
   local key="$1"
   [[ -f "$ENV_PATH" ]] || return 0
   sed -i "/^${key}=.*/d" "$ENV_PATH"
+}
+
+ensure_mssql_image() {
+  local image="$1"
+  local tar_path="${MSSQL_IMAGE_TAR:-}"
+
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    info "SQL image already exists locally: $image"
+    return 0
+  fi
+
+  if [[ -n "$tar_path" ]]; then
+    [[ -f "$tar_path" ]] || err "MSSQL_IMAGE_TAR is set but file does not exist: $tar_path"
+    info "Loading SQL image from tar: $tar_path"
+    docker load -i "$tar_path" >/dev/null || err "Failed to load docker image tar: $tar_path"
+    if docker image inspect "$image" >/dev/null 2>&1; then
+      info "SQL image loaded from tar successfully."
+      return 0
+    fi
+    warn "Image tag '$image' was not found after docker load."
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    if ! curl -sSIL --connect-timeout 8 --max-time 15 https://mcr.microsoft.com/v2/ >/dev/null 2>&1; then
+      warn "Cannot reach https://mcr.microsoft.com/v2/ from this machine."
+      warn "If you are behind firewall/proxy, enable VPN or configure Docker proxy."
+    fi
+  fi
+
+  info "Pulling SQL image from registry: $image"
+  for attempt in 1 2 3; do
+    if docker pull "$image"; then
+      info "SQL image pulled successfully."
+      return 0
+    fi
+    warn "docker pull failed (attempt $attempt/3). Retrying in 5s..."
+    sleep 5
+  done
+
+  err "Unable to pull '$image'. You can either fix network access to mcr.microsoft.com or set MSSQL_IMAGE_TAR=/path/to/image.tar and retry."
 }
 
 # -------------------------
@@ -75,7 +115,7 @@ fi
 [[ -n "$SQL_PASS" ]] || err "SQL Server SA password is required."
 
 CONTAINER_NAME="mssql_restore"
-MSSQL_IMAGE="mcr.microsoft.com/mssql/server:2022-latest"
+MSSQL_IMAGE="${MSSQL_IMAGE:-mcr.microsoft.com/mssql/server:2022-latest}"
 MSSQL_PORT="14333"     # host port (external) - can be 14333 since 1433 is taken on your machine
 
 # =========================
@@ -155,6 +195,8 @@ docker info >/dev/null 2>&1 || err "Docker daemon not running."
 # =========================
 # Recreate container
 # =========================
+ensure_mssql_image "$MSSQL_IMAGE"
+
 if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
   info "Removing existing container..."
   docker rm -f "$CONTAINER_NAME" >/dev/null

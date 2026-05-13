@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS_PATH = PROJECT_ROOT / "requirements.txt"
 ATC_REFERENCE = PROJECT_ROOT / "data" / "external" / "who_atc_ddd.csv"
 RESTORE_SCRIPT = PROJECT_ROOT / "scripts" / "restore_db.sh"
+RESTORE_SCRIPT_WINDOWS = PROJECT_ROOT / "restore_mssql_docker.ps1"
 
 
 def _prompt_yes_no(label: str, default: bool) -> bool:
@@ -37,12 +38,34 @@ def _prompt_secret(label: str) -> str:
 
 def _run_restore(env: dict[str, str]) -> None:
     system = platform.system().lower()
-    if system != "linux":
-        raise RuntimeError(
-            f"Unsupported OS for restore: {platform.system()}. "
-            "Use WSL/Linux and run restore_db.sh."
+    if system == "linux":
+        subprocess.run(["bash", str(RESTORE_SCRIPT)], cwd=PROJECT_ROOT, env=env, check=True)
+        return
+    if system == "windows":
+        if not RESTORE_SCRIPT_WINDOWS.exists():
+            raise FileNotFoundError(
+                "Missing Windows restore script: "
+                f"{RESTORE_SCRIPT_WINDOWS}. Re-add it or run restore from WSL/Linux."
+            )
+        subprocess.run(
+            [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(RESTORE_SCRIPT_WINDOWS),
+                "-DB_NAME",
+                "PharmacyStore",
+            ],
+            cwd=PROJECT_ROOT,
+            env=env,
+            check=True,
         )
-    subprocess.run(["bash", str(RESTORE_SCRIPT)], cwd=PROJECT_ROOT, env=env, check=True)
+        return
+    raise RuntimeError(
+        f"Unsupported OS for restore: {platform.system()}. "
+        "Use Linux, Windows, or run restore manually then rerun this script."
+    )
 
 
 def _install_dependencies() -> None:

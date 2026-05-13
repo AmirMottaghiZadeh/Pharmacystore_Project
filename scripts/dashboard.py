@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -18,9 +19,161 @@ SPLITS = [
     ("test_calibrated", "Test (calibrated)"),
 ]
 
+THEME_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&display=swap');
+
+:root {
+  --rx-ink: #14323d;
+  --rx-muted: #5f7982;
+  --rx-surface: #f3f8f8;
+  --rx-panel: #ffffff;
+  --rx-border: #d7e6e7;
+  --rx-primary: #0f766e;
+  --rx-secondary: #0ea5a2;
+  --rx-accent: #75caa5;
+}
+
+.stApp {
+  font-family: "Manrope", "Segoe UI", sans-serif;
+  background:
+    radial-gradient(1200px 420px at 8% -12%, #d7f2e6 0%, transparent 50%),
+    radial-gradient(900px 380px at 95% -14%, #d8edf6 0%, transparent 50%),
+    linear-gradient(180deg, #eef6f8 0%, #f9fcfb 38%, #f6fbfb 100%);
+  color: var(--rx-ink);
+}
+
+[data-testid="stHeader"] {
+  background: rgba(246, 251, 251, 0.78);
+  border-bottom: 1px solid var(--rx-border);
+}
+
+[data-testid="stSidebar"] {
+  background: linear-gradient(180deg, #11343f 0%, #0e2a34 100%);
+  color: #ecf8fb;
+}
+
+[data-testid="stSidebar"] * {
+  color: #ecf8fb !important;
+}
+
+[data-testid="stSidebar"] .stSelectbox label,
+[data-testid="stSidebar"] .stRadio label {
+  color: #b9d7df !important;
+}
+
+[data-testid="stSidebar"] [data-baseweb="select"] > div,
+[data-testid="stSidebar"] .stRadio > div {
+  background: rgba(236, 248, 251, 0.08) !important;
+  border-radius: 12px;
+}
+
+h1, h2, h3 {
+  color: var(--rx-ink);
+  letter-spacing: -0.02em;
+}
+
+.rx-hero {
+  border: 1px solid rgba(17, 94, 89, 0.18);
+  border-radius: 18px;
+  padding: 1.2rem 1.25rem;
+  background: linear-gradient(128deg, rgba(18, 120, 102, 0.14), rgba(117, 202, 165, 0.1));
+  margin: 0.35rem 0 1rem 0;
+}
+
+.rx-hero h2 {
+  margin: 0 0 0.3rem 0;
+  font-size: 1.55rem;
+}
+
+.rx-hero p {
+  margin: 0;
+  color: var(--rx-muted);
+}
+
+.rx-card {
+  border: 1px solid var(--rx-border);
+  background: var(--rx-panel);
+  border-radius: 16px;
+  padding: 0.8rem 1rem;
+  box-shadow: 0 12px 28px rgba(15, 76, 92, 0.08);
+}
+
+.rx-card .label {
+  color: var(--rx-muted);
+  font-size: 0.83rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.rx-card .value {
+  color: var(--rx-ink);
+  margin-top: 0.1rem;
+  font-weight: 800;
+  font-size: 1.35rem;
+}
+
+[data-testid="stMetric"] {
+  border: 1px solid var(--rx-border);
+  border-radius: 14px;
+  padding: 0.65rem 0.85rem;
+  background: var(--rx-panel);
+}
+
+[data-baseweb="tab-list"] {
+  gap: 0.4rem;
+}
+
+button[data-baseweb="tab"] {
+  border-radius: 12px !important;
+  padding: 0.45rem 0.85rem !important;
+  border: 1px solid var(--rx-border) !important;
+  background: #f6fbfb !important;
+}
+
+button[data-baseweb="tab"][aria-selected="true"] {
+  background: linear-gradient(130deg, #d5efe2, #d6edf5) !important;
+  border-color: #9ec9cc !important;
+}
+
+.stAlert {
+  border-radius: 12px;
+  border: 1px solid var(--rx-border);
+}
+</style>
+"""
+
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def _inject_theme() -> None:
+    st.markdown(THEME_CSS, unsafe_allow_html=True)
+
+
+def _hero_block(title: str, description: str) -> None:
+    st.markdown(
+        (
+            "<section class='rx-hero'>"
+            f"<h2>{escape(title)}</h2>"
+            f"<p>{escape(description)}</p>"
+            "</section>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _stat_card(label: str, value: str) -> None:
+    st.markdown(
+        (
+            "<section class='rx-card'>"
+            f"<div class='label'>{escape(label)}</div>"
+            f"<div class='value'>{escape(value)}</div>"
+            "</section>"
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -469,6 +622,71 @@ def _guardrail_table(metrics: dict[str, Any], split_key: str) -> pd.DataFrame:
     return frame
 
 
+def _next_week_projection(
+    base_df: pd.DataFrame,
+    selected_drug: str,
+    prediction_col: str,
+) -> dict[str, Any] | None:
+    if base_df.empty or selected_drug == "" or prediction_col not in base_df.columns:
+        return None
+
+    frame = base_df[base_df["DrugId"] == selected_drug].dropna(
+        subset=["week_start", "y_true", prediction_col]
+    )
+    if frame.empty:
+        return None
+
+    ordered = frame.sort_values("week_start").copy()
+    last = ordered.iloc[-1]
+    next_week = pd.Timestamp(last["week_start"]) + pd.Timedelta(days=7)
+
+    latest_pred = float(last[prediction_col])
+    recent_true = ordered["y_true"].tail(4).astype(float)
+    recent_mean = float(recent_true.mean()) if not recent_true.empty else latest_pred
+
+    growth_rate = recent_true.pct_change().replace([float("inf"), -float("inf")], pd.NA).dropna()
+    if growth_rate.empty:
+        growth_factor = 1.0
+    else:
+        growth_factor = 1.0 + float(growth_rate.tail(3).mean())
+    growth_factor = max(0.65, min(1.35, growth_factor))
+
+    projected = max(0.0, 0.7 * latest_pred + 0.3 * recent_mean * growth_factor)
+
+    low_col = "y_pred_low" if "y_pred_low" in ordered.columns else ""
+    high_col = "y_pred_high" if "y_pred_high" in ordered.columns else ""
+    latest_low = pd.to_numeric(pd.Series([last.get(low_col)]), errors="coerce").iloc[0] if low_col else pd.NA
+    latest_high = pd.to_numeric(pd.Series([last.get(high_col)]), errors="coerce").iloc[0] if high_col else pd.NA
+
+    if pd.notna(latest_low) and pd.notna(latest_high):
+        spread_low = max(0.0, projected + float(latest_low) - latest_pred)
+        spread_high = max(spread_low, projected + float(latest_high) - latest_pred)
+    else:
+        residual_std = float((ordered["y_true"] - ordered[prediction_col]).abs().tail(8).std() or 0.0)
+        spread_low = max(0.0, projected - residual_std)
+        spread_high = projected + residual_std
+
+    trend = "stable"
+    if growth_factor > 1.06:
+        trend = "rising"
+    elif growth_factor < 0.94:
+        trend = "cooling"
+
+    confidence = min(0.95, 0.45 + min(len(ordered), 20) / 40)
+    return {
+        "next_week": next_week,
+        "projected": projected,
+        "low": spread_low,
+        "high": spread_high,
+        "latest_pred": latest_pred,
+        "latest_true": float(last["y_true"]),
+        "latest_week": pd.Timestamp(last["week_start"]),
+        "trend": trend,
+        "confidence": confidence,
+        "history": ordered,
+    }
+
+
 def _render_overview(
     bundle: dict[str, Any],
     leaderboard: pd.DataFrame,
@@ -487,10 +705,14 @@ def _render_overview(
     unique_drugs = manifest.get("unique_drugs")
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Run ID", bundle["run_id"])
-    c2.metric("Created at", created_at.replace("T", " ").replace("Z", " UTC"))
-    c3.metric("Unique weeks", unique_weeks)
-    c4.metric("Unique drugs", unique_drugs)
+    with c1:
+        _stat_card("Run ID", str(bundle["run_id"]))
+    with c2:
+        _stat_card("Created at", created_at.replace("T", " ").replace("Z", " UTC"))
+    with c3:
+        _stat_card("Unique weeks", str(unique_weeks))
+    with c4:
+        _stat_card("Modeled drugs", str(unique_drugs))
     st.caption(f"Data range: `{week_min}` to `{week_max}`")
 
     kpi = _kpi_frame(metrics)
@@ -516,7 +738,7 @@ def _render_overview(
             height=260,
         )
 
-    st.subheader("Champion vs challengers (guardrail)")
+    st.subheader("Clinical benchmark lane")
     split_for_guardrail = st.selectbox("Guardrail split", ["valid", "test"], index=0)
     guardrail = _guardrail_table(metrics, split_for_guardrail)
     if guardrail.empty:
@@ -524,7 +746,7 @@ def _render_overview(
     else:
         st.dataframe(guardrail, width="stretch", height=220)
 
-    st.subheader("Weekly error trend")
+    st.subheader("Weekly diagnostic trend")
     trend = _weekly_error_trend(walk_df, prediction_col_for_walk)
     if trend.empty:
         st.info("Walk-forward prediction file is empty or missing.")
@@ -638,6 +860,71 @@ def _render_explorer(valid_df: pd.DataFrame, prediction_col: str) -> None:
         ],
         width="stretch",
         height=320,
+    )
+
+
+def _render_next_week_forecast(
+    valid_df: pd.DataFrame,
+    walk_df: pd.DataFrame,
+    prediction_col_valid: str,
+    prediction_col_walk: str,
+) -> None:
+    candidates = pd.concat([walk_df, valid_df], ignore_index=True)
+    if candidates.empty:
+        st.warning("No modeled-drug predictions found for next-week forecasting.")
+        return
+
+    modeled_drugs = sorted(candidates["DrugId"].dropna().unique().tolist())
+    if not modeled_drugs:
+        st.warning("Drug list is empty in prediction files.")
+        return
+
+    c1, c2 = st.columns([2, 1])
+    selected_drug = c1.selectbox("Select a modeled drug", options=modeled_drugs, index=0)
+    prefer_source = c2.radio("Data source", options=["Walk-forward", "Validation"], index=0)
+
+    source_df = walk_df if prefer_source == "Walk-forward" else valid_df
+    prediction_col = prediction_col_walk if prefer_source == "Walk-forward" else prediction_col_valid
+    if source_df.empty:
+        source_df = candidates
+        prediction_col = prediction_col_walk if prediction_col_walk in source_df.columns else prediction_col_valid
+
+    result = _next_week_projection(base_df=source_df, selected_drug=selected_drug, prediction_col=prediction_col)
+    if result is None:
+        st.info("Projection cannot be computed for the selected drug with current filters.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Next week forecast", f"{result['projected']:.1f}")
+    c2.metric("Forecast range", f"{result['low']:.1f} - {result['high']:.1f}")
+    c3.metric("Trend signal", str(result["trend"]).title())
+    c4.metric("Confidence", f"{result['confidence'] * 100:.0f}%")
+    st.caption(
+        "Projection week: "
+        f"`{result['next_week'].date()}` | Last observed week: `{result['latest_week'].date()}`"
+    )
+
+    history = result["history"][["week_start", "y_true", prediction_col]].copy()
+    history = history.rename(columns={prediction_col: "model_prediction"})
+    history["next_week_forecast"] = pd.NA
+    future_row = pd.DataFrame(
+        [
+            {
+                "week_start": result["next_week"],
+                "y_true": pd.NA,
+                "model_prediction": pd.NA,
+                "next_week_forecast": result["projected"],
+            }
+        ]
+    )
+    chart_frame = pd.concat([history, future_row], ignore_index=True).sort_values("week_start")
+    st.line_chart(
+        chart_frame.set_index("week_start")[["y_true", "model_prediction", "next_week_forecast"]],
+    )
+
+    st.write(
+        "Forecast logic blends the latest model output with recent demand rhythm (up to 4 weeks) "
+        "and carries forward uncertainty from the most recent prediction interval."
     )
 
 
@@ -764,26 +1051,27 @@ def _render_run_comparison(
 
 def main() -> None:
     st.set_page_config(page_title="Pharmacy Forecast Dashboard", layout="wide")
+    _inject_theme()
 
     root = _project_root()
     data_root = root / "data"
     runs_root = root / "artifacts" / "runs"
     runs = _list_runs(runs_root)
 
-    st.title("PharmacyStore Forecast Dashboard")
-    st.caption(
-        "Overview, forecast explorer, risk alerts, drift monitor, and run comparison "
-        "for UPW XGBoost outputs."
+    st.title("PharmacyStore Interactive Command Center")
+    _hero_block(
+        "Clinical Forecast Deck",
+        "A refreshed medical-pharmacy view of model diagnostics, shortage signals, and forward sales outlook.",
     )
 
     if not runs:
         st.error(f"No runs found in {runs_root}.")
         return
 
-    st.sidebar.header("Dashboard Controls")
-    active_run = st.sidebar.selectbox("Active run", options=runs, index=0)
+    st.sidebar.header("Clinical Controls")
+    active_run = st.sidebar.selectbox("Model run", options=runs, index=0)
     prediction_mode = st.sidebar.radio(
-        "Prediction output",
+        "Therapy forecast profile",
         options=["Raw (Champion)", "Calibrated (Challenger)"],
         index=0,
     )
@@ -801,14 +1089,28 @@ def main() -> None:
     if prefer_calibrated and prediction_col_valid != "y_pred_cal":
         st.sidebar.info("No calibrated predictions in this run file; raw predictions are used.")
 
-    tab_overview, tab_explorer, tab_risk, tab_drift, tab_compare = st.tabs(
-        ["Overview", "Forecast Explorer", "Risk & Alert", "Drift Monitor", "Run Comparison"]
+    tab_overview, tab_explorer, tab_next_week, tab_risk, tab_drift, tab_compare = st.tabs(
+        [
+            "Care Overview",
+            "Therapy Explorer",
+            "Next-Week Forecast",
+            "Risk & Alert",
+            "Drift Monitor",
+            "Run Comparison",
+        ]
     )
 
     with tab_overview:
         _render_overview(bundle=bundle, leaderboard=leaderboard, prediction_col_for_walk=prediction_col_walk)
     with tab_explorer:
         _render_explorer(valid_df=valid_df, prediction_col=prediction_col_valid)
+    with tab_next_week:
+        _render_next_week_forecast(
+            valid_df=valid_df,
+            walk_df=walk_df,
+            prediction_col_valid=prediction_col_valid,
+            prediction_col_walk=prediction_col_walk,
+        )
     with tab_risk:
         _render_risk(valid_df=valid_df, prediction_col=prediction_col_valid)
     with tab_drift:
