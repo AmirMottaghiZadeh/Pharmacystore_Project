@@ -9,9 +9,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-function Info($msg){ Write-Host "✅ $msg" }
-function Warn($msg){ Write-Host "⚠️ $msg" }
-function Err($msg){ Write-Host "❌ $msg"; exit 1 }
+function Info($msg){ Write-Host "[INFO] $msg" }
+function Warn($msg){ Write-Host "[WARN] $msg" }
+function Err($msg){ Write-Host "[ERROR] $msg"; exit 1 }
 
 function HasCmd($name){
   return [bool](Get-Command $name -ErrorAction SilentlyContinue)
@@ -124,7 +124,7 @@ if ($bakFiles.Count -eq 0) {
   Err "No .bak file found in: $BackupDir"
 }
 if ($bakFiles.Count -gt 1) {
-  Write-Host "❌ Multiple .bak files found in $BackupDir:"
+  Write-Host "[ERROR] Multiple .bak files found in ${BackupDir}:"
   $bakFiles | ForEach-Object { Write-Host " - $($_.FullName)" }
   Err "Keep only ONE .bak file in that directory."
 }
@@ -347,5 +347,5 @@ Set-EnvVar "PHARMACYSTORE_SQL_DRIVER" "ODBC Driver 18 for SQL Server"
 Set-EnvVar "PHARMACYSTORE_SQL_ENCRYPT" "false"
 Set-EnvVar "PHARMACYSTORE_SQL_TRUST_CERT" "true"
 
-Info "🎉 DONE — Database restored: $DB_NAME"
-Info "Connect: localhost:$MSSQL_PORT | user=sa"
+Info "DONE - Database restored: $DB_NAME"
+Info "Connect: localhost:${MSSQL_PORT} | user=sa"
