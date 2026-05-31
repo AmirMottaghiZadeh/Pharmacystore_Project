@@ -8,7 +8,8 @@ SCRIPT_PATH="$(readlink -f "$0")"
 [[ -x "$SCRIPT_PATH" ]] || chmod +x "$SCRIPT_PATH"
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   echo "🔐 Re-running with sudo..."
-  exec sudo --preserve-env=SQL_PASS,MSSQL_IMAGE,MSSQL_IMAGE_TAR bash "$SCRIPT_PATH" "$@"
+  # Keep proxy variables so apt/curl checks and optional bootstrap steps can use VPN/proxy.
+  exec sudo --preserve-env=SQL_PASS,MSSQL_IMAGE,MSSQL_IMAGE_TAR,HTTP_PROXY,HTTPS_PROXY,NO_PROXY,http_proxy,https_proxy,no_proxy,ALL_PROXY,all_proxy bash "$SCRIPT_PATH" "$@"
 fi
 
 info(){ echo "✅ $*"; }

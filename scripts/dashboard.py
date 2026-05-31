@@ -152,6 +152,14 @@ def _inject_theme() -> None:
     st.markdown(THEME_CSS, unsafe_allow_html=True)
 
 
+def _has_streamlit_context() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+    except Exception:
+        return False
+    return get_script_run_ctx() is not None
+
+
 def _hero_block(title: str, description: str) -> None:
     st.markdown(
         (
@@ -907,17 +915,14 @@ def _render_next_week_forecast(
     history = result["history"][["week_start", "y_true", prediction_col]].copy()
     history = history.rename(columns={prediction_col: "model_prediction"})
     history["next_week_forecast"] = pd.NA
-    future_row = pd.DataFrame(
-        [
-            {
-                "week_start": result["next_week"],
-                "y_true": pd.NA,
-                "model_prediction": pd.NA,
-                "next_week_forecast": result["projected"],
-            }
-        ]
-    )
-    chart_frame = pd.concat([history, future_row], ignore_index=True).sort_values("week_start")
+    chart_frame = history.copy()
+    chart_frame.loc[len(chart_frame)] = {
+        "week_start": result["next_week"],
+        "y_true": pd.NA,
+        "model_prediction": pd.NA,
+        "next_week_forecast": result["projected"],
+    }
+    chart_frame = chart_frame.sort_values("week_start")
     st.line_chart(
         chart_frame.set_index("week_start")[["y_true", "model_prediction", "next_week_forecast"]],
     )
@@ -1120,4 +1125,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if not _has_streamlit_context():
+        print(
+            "This dashboard must run with Streamlit.\n"
+            "Use: streamlit run scripts/dashboard.py"
+        )
+    else:
+        main()

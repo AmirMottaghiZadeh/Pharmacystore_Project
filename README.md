@@ -13,16 +13,17 @@
 4. [Quick start](#quick-start)
 5. [Execution flow](#execution-flow-run_allpy)
 6. [Architecture overview](#architecture-overview)
-7. [Manual commands](#manual-commands)
-8. [Dashboard (Streamlit)](#dashboard-streamlit)
-9. [Configuration](#configuration-env)
-10. [Feature engineering](#feature-engineering)
-11. [Forecast target & evaluation](#forecast-target--evaluation)
-12. [Outputs](#outputs)
-13. [Reproducibility](#reproducibility)
-14. [Operational maturity checklist](#operational-maturity-checklist)
-15. [Troubleshooting](#troubleshooting)
-16. [Credits & maintenance](#credits--maintenance)
+7. [Pipeline run (screenshots)](#pipeline-run-screenshots)
+8. [Manual commands](#manual-commands)
+9. [Dashboard (Streamlit)](#dashboard-streamlit)
+10. [Configuration](#configuration-env)
+11. [Feature engineering](#feature-engineering)
+12. [Forecast target & evaluation](#forecast-target--evaluation)
+13. [Outputs](#outputs)
+14. [Reproducibility](#reproducibility)
+15. [Operational maturity checklist](#operational-maturity-checklist)
+16. [Troubleshooting](#troubleshooting)
+17. [Credits & maintenance](#credits--maintenance)
 
 ## Why it matters
 - Automates extraction from SQL Server backups and builds a repeatable training dataset.
@@ -82,6 +83,18 @@ flowchart TD
 - **Model**: train XGBoost with walk-forward evaluation and baselines; export metrics and serialized artifacts.
 - **Operate**: scripts wrap the workflow (`run_all.py`, `scripts/run_all.py`) with environment-driven settings.
 
+## Pipeline run (screenshots)
+Sample CLI traces from an end-to-end `run_all.py` execution — data extraction, ATC classification, feature engineering, and model training/evaluation.
+
+![Pipeline – extraction & ATC classification](ScreenShots/Phramacy_store-1.png)
+*Initial extraction from the restored SQL Server database and ATC classification sample.*
+
+![Pipeline – feature build & training start](ScreenShots/Pharmacy_store.png)
+*Weekly feature build (UPW aggregation, holiday merge, rolling stats) and the start of XGBoost training.*
+
+![Pipeline – evaluation & metrics](ScreenShots/Pharmacy_store_metrics.png)
+*Walk-forward evaluation logs with MAE / RMSE / WAPE / sMAPE per fold and final artifacts written.*
+
 ## Manual commands
 - Build weekly features: `python -m pharmacystore.pipeline run`
 - Train main XGBoost: `python -m pharmacystore.pipeline train`
@@ -107,6 +120,9 @@ The repository includes an interactive dashboard at `scripts/dashboard.py` that 
 Install dashboard dependency and run:
 - `python -m pip install streamlit`
 - `streamlit run scripts/dashboard.py`
+
+![Streamlit dashboard – Clinical Forecast Deck](ScreenShots/Dashboard.png)
+*Interactive Command Center: run selector, fold/category filters, and forecast-vs-actual trend lines.*
 
 Implemented views:
 - **Overview**: KPI cards (MAE/RMSE/WAPE/sMAPE), weekly error trend, and run leaderboard.
